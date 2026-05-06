@@ -1,0 +1,410 @@
+"""
+PoseWorker — QThread that captures frames from OpenCV, runs MediaPipe
+pose detection, applies OneEuroFilter smoothing, and emits processed
+frames + metrics to the GUI thread via pyqtSignal.
+"""
+
+import cv2
+import math as m
+import os
+import time
+import numpy as np
+from PyQt5.QtCore import QThread, pyqtSignal, QMutex
+from PyQt5.QtGui import QImage
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+
+from one_euro_filter import OneEuroFilter
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_full.task")
+
+# Landmark indices (MediaPipe Pose)
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER = 12
+LEFT_EAR = 7
+RIGHT_EAR = 8
+LEFT_HIP = 23
+
+
+def _find_distance(x1, y1, x2, y2):
+    return m.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+
+
+def _find_angle(x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    if dy == 0:
+        return 90.0
+    return m.degrees(m.atan2(abs(dx), abs(dy)))
+
+
+def _draw_unicode_batch(img, items):
+    try:
+        from PIL import Image as PilImage, ImageDraw, ImageFont
+        rgb_img = PilImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(rgb_img)
+        for pos, text, font_scale, bgr in items:
+            font_px = max(16, int(font_scale * 30))
+            try:
+                fnt = ImageFont.truetype("arial.ttf", font_px)
+            except OSError:
+                fnt = ImageFont.load_default()
+            b, g, r_ch = bgr
+            draw.text(pos, text, font=fnt, fill=(r_ch, g, b))
+        img[:] = cv2.cvtColor(np.array(rgb_img), cv2.COLOR_RGB2BGR)
+    except ImportError:
+        for pos, text, font_scale, bgr in items:
+            cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, bgr, 2)
+
+
+class PoseWorker(QThread):
+    """
+    Worker thread: camera capture → MediaPipe → skeleton overlay → signals.
+
+    Signals
+    -------
+    frame_ready(QImage)
+        BGR frame with skeleton drawn, converted to QImage (RGB888).
+    metrics_ready(dict)
+        Dictionary with keys: neck_angle, shoulder_tilt, shoulder_depth,
+        is_good_posture, good_time, bad_time, is_leaning, is_tilted, fps.
+    """
+
+    front_frame_ready = pyqtSignal(QImage)
+    side_frame_ready = pyqtSignal(QImage)
+    metrics_ready = pyqtSignal(dict)
+
+    def __init__(
+        self,
+        video_path=None,
+        parent=None,
+        camera_front_id: int = 0,
+        camera_side_id: int = 1,
+        front_video_path: int = 0,
+        side_video_path: str = "http://192.168.1.100:8080/video",
+    ):
+        super().__init__(parent)
+        # Back-compat: video_path is treated as front input if provided.
+        self.video_path = video_path
+        self.camera_front_id = camera_front_id
+        self.camera_side_id = camera_side_id
+        self.front_video_path = front_video_path
+        self.side_video_path = side_video_path
+        self._running = False
+
+        # Thresholds (can be updated from GUI via set_thresholds)
+        self.offset_threshold = 0.3
+        self.medical_cva_threshold = 50.0
+        self.shoulder_tilt_threshold = 0.05
+        self.forward_lean_threshold = 0.10
+        self.time_threshold = 180
+        self.filter_min_cutoff = 0.004
+        self.filter_beta = 0.7
+        self._mutex = QMutex()
+
+    # ── public API (called from GUI thread) ──────────────────────────
+
+    def set_thresholds(self, **kw):
+        self._mutex.lock()
+        for k, v in kw.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+        self._mutex.unlock()
+
+    def stop(self):
+        self._running = False
+
+    # ── thread entry point ───────────────────────────────────────────
+
+    def run(self):
+        self._running = True
+
+        # Colors
+        green = (127, 255, 0)
+        red = (50, 50, 255)
+        yellow = (0, 255, 255)
+        white = (255, 255, 255)
+        pink = (255, 0, 255)
+        light_green = (127, 233, 100)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # MediaPipe init
+        base_options = mp_python.BaseOptions(
+            model_asset_path=MODEL_PATH,
+            delegate=mp_python.BaseOptions.Delegate.CPU,
+        )
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_poses=1,
+        )
+        landmarker_front = mp_vision.PoseLandmarker.create_from_options(options)
+        landmarker_side = mp_vision.PoseLandmarker.create_from_options(options)
+
+        # VideoCapture init (front + side)
+        front_src = (
+            self.front_video_path
+            if self.front_video_path is not None
+            else (self.video_path if self.video_path is not None else self.camera_front_id)
+        )
+        side_src = self.side_video_path if self.side_video_path is not None else self.camera_side_id
+
+        cap_front = cv2.VideoCapture(0)
+        cap_side = cv2.VideoCapture("http://192.168.1.4:8080/video")
+
+        fps_front = cap_front.get(cv2.CAP_PROP_FPS) or 30.0
+        fps_side = cap_side.get(cv2.CAP_PROP_FPS) or 30.0
+
+        t0 = time.monotonic()
+        good_frames = 0
+        bad_frames = 0
+
+        cva_filter = None
+        tilt_filter = None
+        depth_filter = None
+
+        while self._running:
+            ok_front, image_front = cap_front.read()
+            ok_side, image_side = cap_side.read()
+            if not ok_front or not ok_side:
+                break
+
+            live_fps_front = cap_front.get(cv2.CAP_PROP_FPS)
+            if live_fps_front and live_fps_front > 0:
+                fps_front = live_fps_front
+            live_fps_side = cap_side.get(cv2.CAP_PROP_FPS)
+            if live_fps_side and live_fps_side > 0:
+                fps_side = live_fps_side
+
+            hf, wf = image_front.shape[:2]
+            hs, ws = image_side.shape[:2]
+
+            front_rgb = cv2.cvtColor(image_front, cv2.COLOR_BGR2RGB)
+            side_rgb = cv2.cvtColor(image_side, cv2.COLOR_BGR2RGB)
+            mp_front = mp.Image(image_format=mp.ImageFormat.SRGB, data=front_rgb)
+            mp_side = mp.Image(image_format=mp.ImageFormat.SRGB, data=side_rgb)
+
+            timestamp_ms = int((time.monotonic() - t0) * 1000.0)
+
+            res_front = landmarker_front.detect_for_video(mp_front, timestamp_ms)
+            res_side = landmarker_side.detect_for_video(mp_side, timestamp_ms)
+
+            if (
+                (not res_front.pose_world_landmarks or not res_front.pose_landmarks)
+                or (not res_side.pose_landmarks)
+            ):
+                self._emit_front_frame(image_front, hf, wf)
+                self._emit_side_frame(image_side, hs, ws)
+                continue
+
+            lm_world_f = res_front.pose_world_landmarks[0]
+            lm_norm_f = res_front.pose_landmarks[0]
+            lm_norm_s = res_side.pose_landmarks[0]
+
+            def px(idx):
+                return int(lm_norm_f[idx].x * wf), int(lm_norm_f[idx].y * hf)
+
+            def px_side(idx):
+                return int(lm_norm_s[idx].x * ws), int(lm_norm_s[idx].y * hs)
+
+            LS = LEFT_SHOULDER
+            RS = RIGHT_SHOULDER
+            LE = LEFT_EAR
+            RE = RIGHT_EAR
+
+            shoulder_depth = (lm_world_f[LS].z + lm_world_f[RS].z) / 2.0
+            shoulder_tilt = abs(lm_world_f[LS].y - lm_world_f[RS].y)
+
+            raw_cva_2d = self._calculate_2d_cva(lm_norm_s, ws, hs)
+            if raw_cva_2d is None:
+                self._emit_front_frame(image_front, hf, wf)
+                self._emit_side_frame(image_side, hs, ws)
+                continue
+
+            # One Euro Filter
+            t = timestamp_ms / 1000.0
+            if cva_filter is None:
+                cva_filter = OneEuroFilter(
+                    t,
+                    raw_cva_2d,
+                    min_cutoff=self.filter_min_cutoff,
+                    beta=self.filter_beta,
+                )
+                tilt_filter = OneEuroFilter(t, shoulder_tilt,
+                                            min_cutoff=self.filter_min_cutoff, beta=self.filter_beta)
+                depth_filter = OneEuroFilter(t, shoulder_depth,
+                                             min_cutoff=self.filter_min_cutoff, beta=self.filter_beta)
+            else:
+                raw_cva_2d = float(cva_filter(t, raw_cva_2d))
+                shoulder_tilt = float(tilt_filter(t, shoulder_tilt))
+                shoulder_depth = float(depth_filter(t, shoulder_depth))
+
+            # Read thresholds
+            self._mutex.lock()
+            cva_limit = self.medical_cva_threshold
+            fl = self.forward_lean_threshold
+            st = self.shoulder_tilt_threshold
+            tt = self.time_threshold
+            self._mutex.unlock()
+
+            is_good_neck = raw_cva_2d >= cva_limit
+            is_leaning = shoulder_depth < -fl
+            is_tilted = shoulder_tilt > st
+            is_good_posture = is_good_neck and not is_leaning and not is_tilted
+
+            if is_good_posture:
+                good_frames += 1
+                bad_frames = 0
+            else:
+                bad_frames += 1
+                good_frames = 0
+
+            fps = float(min(fps_front, fps_side) or 30.0)
+            good_time = (1 / fps) * good_frames
+            bad_time = (1 / fps) * bad_frames
+
+            # ── Draw skeleton ──────────────────────────────────────
+            skel_color = green if is_good_posture else red
+            l_s = px(LS); r_s = px(RS)
+
+            cv2.circle(image_front, l_s, 7, white, 2)
+            cv2.circle(image_front, r_s, 7, pink, -1)
+            cv2.line(image_front, l_s, r_s, skel_color, 2)
+
+            # HUD (front)
+            cv2.putText(image_front, f'CVA:  {raw_cva_2d:.1f} deg', (10, 30), font, 0.6,
+                        light_green if is_good_neck else red, 2)
+            cv2.putText(image_front, f'Tilt: {shoulder_tilt * 100:.1f} cm', (10, 60), font, 0.6,
+                        light_green if not is_tilted else red, 2)
+            cv2.putText(image_front, f'Depth:{shoulder_depth:+.2f} m', (10, 90), font, 0.6,
+                        light_green if not is_leaning else yellow, 2)
+
+            # Side overlay (CVA + points)
+            side_pts = self._get_side_cva_points(lm_norm_s, ws, hs)
+            if side_pts is not None:
+                (ear_x, ear_y), (c7_x, c7_y) = side_pts
+                ear_px = (int(ear_x), int(ear_y))
+                c7_px = (int(c7_x), int(c7_y))
+                cv2.circle(image_side, c7_px, 6, (0, 255, 255), -1)   # C7 proxy (shoulder)
+                cv2.circle(image_side, ear_px, 6, (255, 255, 255), 2)  # Ear
+                cv2.line(image_side, c7_px, ear_px, skel_color, 2)
+                cv2.line(image_side, c7_px, (c7_px[0] + 120, c7_px[1]), (180, 180, 180), 2)
+
+            cv2.putText(
+                image_side,
+                f'2D CVA: {raw_cva_2d:.1f}°',
+                (10, 30),
+                font,
+                0.7,
+                light_green if is_good_neck else red,
+                2,
+            )
+
+            status_y = 130
+            items = []
+            if is_good_posture:
+                items.append(((10, status_y), 'Правильна постава', 0.85, light_green))
+            else:
+                if is_leaning:
+                    items.append(((10, status_y), 'Нахил вперед!', 0.85, yellow))
+                    status_y += 40
+                if is_tilted:
+                    items.append(((10, status_y), 'Перекіс плечей!', 0.85, red))
+            if items:
+                _draw_unicode_batch(image_front, items)
+
+            self._emit_front_frame(image_front, hf, wf)
+            self._emit_side_frame(image_side, hs, ws)
+            self.metrics_ready.emit({
+                'neck_angle': raw_cva_2d,  # kept for back-compat with GUI
+                'cva_2d': raw_cva_2d,
+                'raw_cva_2d': raw_cva_2d,
+                'cva_threshold': cva_limit,
+                'shoulder_tilt': shoulder_tilt,
+                'shoulder_depth': shoulder_depth,
+                'is_good_posture': is_good_posture,
+                'is_leaning': is_leaning,
+                'is_tilted': is_tilted,
+                'good_time': good_time,
+                'bad_time': bad_time,
+                'fps': fps,
+            })
+
+        landmarker_front.close()
+        landmarker_side.close()
+        cap_front.release()
+        cap_side.release()
+
+    def _emit_front_frame(self, bgr_image, h, w):
+        rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        self.front_frame_ready.emit(qimg.copy())
+
+    def _emit_side_frame(self, bgr_image, h, w):
+        rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        self.side_frame_ready.emit(qimg.copy())
+
+    @staticmethod
+    def _calculate_2d_cva(landmarks, width: int, height: int) -> float | None:
+        """
+        2D Craniovertebral Angle (CVA) from side view using pixel coords.
+
+        Uses a horizontal reference through the shoulder (C7 proxy) and the
+        vector from shoulder -> ear (tragus proxy). Angle is in degrees.
+        """
+        try:
+            l_ear = landmarks[LEFT_EAR]
+            r_ear = landmarks[RIGHT_EAR]
+            l_sh = landmarks[LEFT_SHOULDER]
+            r_sh = landmarks[RIGHT_SHOULDER]
+        except Exception:
+            return None
+
+        pts = PoseWorker._get_side_cva_points(landmarks, width, height)
+        if pts is None:
+            return None
+        (ear_x, ear_y), (sh_x, sh_y) = pts
+
+        dx = ear_x - sh_x
+        dy = sh_y - ear_y  # positive if ear is above shoulder
+        if dx == 0 and dy == 0:
+            return None
+
+        # CVA is the acute angle between the horizontal through C7 (shoulder proxy)
+        # and the line from C7 -> ear (tragus proxy). Ensure 0..90° regardless of
+        # facing direction (dx sign) and image y-axis direction.
+        angle = m.degrees(m.atan2(abs(dy), abs(dx)))
+        return float(angle)
+
+    @staticmethod
+    def _get_side_cva_points(landmarks, width: int, height: int):
+        """
+        Return ((ear_x, ear_y), (c7_x, c7_y)) in pixel coords for side CVA calc.
+        Ear: LEFT_EAR or RIGHT_EAR
+        C7 proxy: LEFT_SHOULDER or RIGHT_SHOULDER
+        Picks the more visible side.
+        """
+        try:
+            l_ear = landmarks[LEFT_EAR]
+            r_ear = landmarks[RIGHT_EAR]
+            l_sh = landmarks[LEFT_SHOULDER]
+            r_sh = landmarks[RIGHT_SHOULDER]
+        except Exception:
+            return None
+
+        ear = l_ear if getattr(l_ear, "visibility", 0.0) >= getattr(r_ear, "visibility", 0.0) else r_ear
+        sh = l_sh if getattr(l_sh, "visibility", 0.0) >= getattr(r_sh, "visibility", 0.0) else r_sh
+
+        ear_x = float(ear.x) * width
+        ear_y = float(ear.y) * height
+        sh_x = float(sh.x) * width
+        sh_y = float(sh.y) * height
+
+        if not (m.isfinite(ear_x) and m.isfinite(ear_y) and m.isfinite(sh_x) and m.isfinite(sh_y)):
+            return None
+
+        return (ear_x, ear_y), (sh_x, sh_y)

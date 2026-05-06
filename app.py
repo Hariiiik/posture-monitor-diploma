@@ -1,344 +1,555 @@
+"""
+Posture Monitor — PyQt5 GUI Application
+========================================
+Main window with two tabs:
+  1. Live Dashboard  — real-time video, neck-angle chart, traffic-light, controls
+  2. Analytics       — placeholder charts for future SQLCipher integration
+"""
 
-
-import cv2
-import math as m
-import argparse
-import os
+import sys
+import math
 import numpy as np
+from collections import deque
 
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
-from mediapipe.tasks.python.vision.pose_landmarker import PoseLandmark
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTabWidget,
+    QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFrame, QGroupBox, QSpinBox, QDoubleSpinBox,
+    QFormLayout, QSizePolicy, QMessageBox,
+)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QPixmap, QFont, QColor
 
-# Path to the downloaded model
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_full.task")
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
-def findDistance(x1, y1, x2, y2):
+from worker import PoseWorker
+
+# ─── Audio warning helper ────────────────────────────────────────────────────
+
+def send_warning_beep(duration_ms=500, freq=800):
     """
-    Calculate the Euclidean distance between two points.
-
-    Args:
-        x1, y1: Coordinates of the first point.
-        x2, y2: Coordinates of the second point.
-
-    Returns:
-        Distance between the two points.
-    """
-    dist = m.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-    return dist
-
-def findAngle(x1, y1, x2, y2):
-    """
-    Calculate the inclination angle (degrees) of the vector from (x1, y1)
-    to (x2, y2) relative to the vertical axis.
-    Works correctly with world-space coordinates (metres).
-
-    Args:
-        x1, y1: World-space origin point (metres).
-        x2, y2: World-space target point (metres).
-
-    Returns:
-        Angle in degrees from vertical (0° = perfectly upright).
-    """
-    dx = x2 - x1
-    dy = y2 - y1
-    if dy == 0:
-        return 90.0
-    return m.degrees(m.atan2(abs(dx), abs(dy)))
-
-def sendWarning(x):
-    """
-    Placeholder function for sending a warning.
-    """
-    pass
-
-
-def _draw_unicode_batch(img, items):
-    """
-    Render a batch of Unicode (Cyrillic) text onto an OpenCV BGR image.
-    Uses a single PIL round-trip for all items.
-
-    items: list of (pos, text, font_scale, bgr_color)
-    Falls back to cv2.putText (ASCII-only) if Pillow is unavailable.
+    Play an audible warning beep.
+    Uses sounddevice + numpy to generate a sine-wave tone.
+    Falls back to a simple print if sounddevice is unavailable.
     """
     try:
-        from PIL import Image as PilImage, ImageDraw, ImageFont
-        rgb_img = PilImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        draw    = ImageDraw.Draw(rgb_img)
-        for pos, text, font_scale, bgr in items:
-            font_px = max(16, int(font_scale * 30))
-            try:
-                fnt = ImageFont.truetype("arial.ttf", font_px)
-            except OSError:
-                fnt = ImageFont.load_default()
-            b, g, r_ch = bgr
-            draw.text(pos, text, font=fnt, fill=(r_ch, g, b))
-        img[:] = cv2.cvtColor(np.array(rgb_img), cv2.COLOR_RGB2BGR)
-    except ImportError:
-        for pos, text, font_scale, bgr in items:
-            cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale, bgr, 2)
+        import sounddevice as sd
+        sr = 44100
+        t = np.linspace(0, duration_ms / 1000.0, int(sr * duration_ms / 1000.0), endpoint=False)
+        wave = (0.5 * np.sin(2 * math.pi * freq * t)).astype(np.float32)
+        sd.play(wave, sr, blocking=False)
+    except Exception:
+        print("\a")  # terminal bell fallback
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='Posture Monitor with MediaPipe')
-    parser.add_argument('--video', type=str, default=None, help='Path to the input video file. If not provided, the webcam will be used.')
-    parser.add_argument('--offset-threshold', type=float, default=0.3, help='Shoulder alignment threshold in world metres (default: 0.3 m). Shoulder-to-shoulder distance below this value indicates a side-view pose.')
-    parser.add_argument('--neck-angle-threshold', type=int, default=25, help='Threshold value for neck inclination angle.')
-    parser.add_argument('--torso-angle-threshold', type=int, default=10, help='Threshold value for torso inclination angle.')
-    parser.add_argument('--time-threshold', type=int, default=180, help='Time threshold for triggering a posture alert.')
-    parser.add_argument('--shoulder-tilt-threshold', type=float, default=0.05,
-                        help='Max allowed Y-difference between shoulders in world metres (default: 0.05 m = 5 cm).')
-    parser.add_argument('--forward-lean-threshold', type=float, default=0.10,
-                        help='Shoulder Z depth below which a forward lean is detected (default: 0.10 m).')
-    return parser.parse_args()
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Live Dashboard Tab
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def main(video_path=None, offset_threshold=0.3, neck_angle_threshold=25, torso_angle_threshold=10,
-         time_threshold=180, shoulder_tilt_threshold=0.05, forward_lean_threshold=0.10):
-    # Initialize frame counters.
-    good_frames = 0
-    bad_frames = 0
+class LiveDashboardTab(QWidget):
+    """Tab 1 — real-time video feed, neck-angle chart, indicators, controls."""
 
-    # Font type.
-    font = cv2.FONT_HERSHEY_SIMPLEX
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
-    # Colors.
-    blue = (255, 127, 0)
-    red = (50, 50, 255)
-    green = (127, 255, 0)
-    dark_blue = (127, 20, 0)
-    light_green = (127, 233, 100)
-    yellow = (0, 255, 255)
-    pink = (255, 0, 255)
-    white = (255, 255, 255)
+        self._angle_buf = deque(maxlen=300)
+        self._time_buf = deque(maxlen=300)
+        self._warning_active = False
+        self._calibrating = False
 
-    # Initialize MediaPipe PoseLandmarker (Tasks API).
-    base_options = mp_python.BaseOptions(
-        model_asset_path=MODEL_PATH,
-        delegate=mp_python.BaseOptions.Delegate.CPU,
-    )
-    options = mp_vision.PoseLandmarkerOptions(
-        base_options=base_options,
-        running_mode=mp_vision.RunningMode.VIDEO,
-        num_poses=1,
-    )
-    landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+        # ── Video widget ──────────────────────────────────────────────────
+        self.video_label = QLabel("Натисніть «Start Monitoring» для початку")
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setMinimumSize(640, 480)
+        self.video_label.setStyleSheet(
+            "background: #1a1a2e; color: #888; border: 2px solid #333; border-radius: 8px;"
+        )
 
-    # For file input, replace file name with <path>.
-    cap = cv2.VideoCapture(video_path) if video_path else cv2.VideoCapture(0)
+        # ── Side (picture-in-picture) video widget ────────────────────────
+        self.side_video_label = QLabel("")
+        self.side_video_label.setAlignment(Qt.AlignCenter)
+        self.side_video_label.setMinimumSize(320, 240)
+        self.side_video_label.setMaximumSize(360, 270)
+        self.side_video_label.setStyleSheet(
+            "background: #111827; color: #888; border: 2px solid #333; border-radius: 8px;"
+        )
 
-    # Meta.
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps == 0:
-        fps = 30.0  # fallback for webcams that report 0
+        # ── Matplotlib chart (in-place redraw) ────────────────────────────
+        self.chart_fig = Figure(figsize=(6, 2.2), dpi=80)
+        self.chart_fig.patch.set_facecolor('#1a1a2e')
+        self.chart_ax = self.chart_fig.add_subplot(111)
+        self.chart_ax.set_facecolor('#16213e')
+        self.chart_ax.set_ylabel('2D CVA °', color='#aaa', fontsize=9)
+        self.chart_ax.tick_params(colors='#888', labelsize=8)
+        for spine in self.chart_ax.spines.values():
+            spine.set_color('#333')
+        self.chart_line, = self.chart_ax.plot([], [], color='#00d2ff', linewidth=1.5)
+        self.chart_threshold_line = None  # drawn once we know threshold
+        self.chart_canvas = FigureCanvas(self.chart_fig)
+        self.chart_canvas.setMinimumHeight(150)
 
-    frame_index = 0
+        # ── Traffic-light indicators ──────────────────────────────────────
+        indicator_box = QGroupBox("Стан")
+        indicator_box.setStyleSheet(
+            "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
+            "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
+            "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
+        )
+        ind_layout = QHBoxLayout()
+        self.green_light = self._make_light('#2d6a2d', 30)
+        self.red_light = self._make_light('#6a2d2d', 30)
+        self.status_label = QLabel("—")
+        self.status_label.setStyleSheet("color: #aaa; font-size: 13px;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        ind_layout.addWidget(self.green_light)
+        ind_layout.addWidget(self.red_light)
+        ind_layout.addWidget(self.status_label)
+        indicator_box.setLayout(ind_layout)
 
-    while True:
-        # Capture frames.
-        success, image = cap.read()
-        if not success:
-            print("Null.Frames")
-            break
+        # ── Time labels ───────────────────────────────────────────────────
+        self.good_time_label = QLabel("Good: 0.0 s")
+        self.good_time_label.setStyleSheet("color: #7fff7f; font-size: 12px;")
+        self.bad_time_label = QLabel("Bad: 0.0 s")
+        self.bad_time_label.setStyleSheet("color: #ff7f7f; font-size: 12px;")
 
-        # Get fps.
-        live_fps = cap.get(cv2.CAP_PROP_FPS)
-        if live_fps > 0:
-            fps = live_fps
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(self.good_time_label)
+        time_layout.addWidget(self.bad_time_label)
 
-        # Get height and width of the frame.
-        h, w = image.shape[:2]
+        # ── Controls ──────────────────────────────────────────────────────
+        ctrl_box = QGroupBox("Управління")
+        ctrl_box.setStyleSheet(
+            "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
+            "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
+            "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
+        )
+        btn_style = (
+            "QPushButton { background: #16213e; color: #ddd; border: 1px solid #555; "
+            "border-radius: 6px; padding: 8px 18px; font-size: 13px; }"
+            "QPushButton:hover { background: #1a3a5c; }"
+            "QPushButton:disabled { background: #111; color: #555; }"
+        )
+        self.btn_start = QPushButton("▶  Start Monitoring")
+        self.btn_stop = QPushButton("■  Stop Monitoring")
+        self.btn_calibrate = QPushButton("⊕  Calibrate")
+        self.btn_stop.setEnabled(False)
+        self.btn_calibrate.setEnabled(False)
+        for b in (self.btn_start, self.btn_stop, self.btn_calibrate):
+            b.setStyleSheet(btn_style)
 
-        # Convert BGR to RGB for MediaPipe.
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        self.calibrate_label = QLabel("")
+        self.calibrate_label.setStyleSheet("color: #ffcc00; font-size: 12px;")
+        self.calibrate_label.setAlignment(Qt.AlignCenter)
 
-        # Calculate timestamp in milliseconds.
-        timestamp_ms = int(frame_index * (1000.0 / fps))
-        frame_index += 1
+        ctrl_layout = QHBoxLayout()
+        ctrl_layout.addWidget(self.btn_start)
+        ctrl_layout.addWidget(self.btn_stop)
+        ctrl_layout.addWidget(self.btn_calibrate)
+        ctrl_v = QVBoxLayout()
+        ctrl_v.addLayout(ctrl_layout)
+        ctrl_v.addWidget(self.calibrate_label)
+        ctrl_box.setLayout(ctrl_v)
 
-        # Run pose detection.
-        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        # ── Settings panel (GUI thresholds) ───────────────────────────────
+        settings_box = QGroupBox("Налаштування порогів")
+        settings_box.setStyleSheet(
+            "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
+            "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
+            "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
+            "QLabel { color: #bbb; font-size: 12px; }"
+            "QSpinBox, QDoubleSpinBox { background: #16213e; color: #ddd; "
+            "border: 1px solid #555; border-radius: 4px; padding: 3px; }"
+        )
+        form = QFormLayout()
 
-        # Skip frame if world landmarks are unavailable.
-        if (not result.pose_world_landmarks or len(result.pose_world_landmarks) == 0
-                or not result.pose_landmarks or len(result.pose_landmarks) == 0):
-            cv2.imshow('MediaPipe Pose', image)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
+        self.spin_neck = QSpinBox()
+        self.spin_neck.setRange(5, 60)
+        self.spin_neck.setValue(25)
+        self.spin_neck.setSuffix(" °")
+        form.addRow("Кут шиї:", self.spin_neck)
 
-        # 3-D world landmarks (metres, origin at hip midpoint) — used for analysis.
-        lm_world = result.pose_world_landmarks[0]
-        # Normalised 2-D landmarks — used only for drawing on the frame.
-        lm_norm  = result.pose_landmarks[0]
+        self.spin_tilt = QDoubleSpinBox()
+        self.spin_tilt.setRange(0.01, 0.30)
+        self.spin_tilt.setValue(0.05)
+        self.spin_tilt.setSingleStep(0.01)
+        self.spin_tilt.setSuffix(" m")
+        form.addRow("Нахил плечей:", self.spin_tilt)
 
-        def px(landmark_idx):
-            """Return pixel (x, y) position from normalised 2-D landmarks."""
-            return int(lm_norm[landmark_idx].x * w), int(lm_norm[landmark_idx].y * h)
+        self.spin_lean = QDoubleSpinBox()
+        self.spin_lean.setRange(0.01, 0.50)
+        self.spin_lean.setValue(0.10)
+        self.spin_lean.setSingleStep(0.01)
+        self.spin_lean.setSuffix(" m")
+        form.addRow("Нахил вперед:", self.spin_lean)
 
-        # Landmark indices from PoseLandmark enum.
-        LEFT_SHOULDER  = PoseLandmark.LEFT_SHOULDER.value
-        RIGHT_SHOULDER = PoseLandmark.RIGHT_SHOULDER.value
-        LEFT_EAR       = PoseLandmark.LEFT_EAR.value
-        RIGHT_EAR      = PoseLandmark.RIGHT_EAR.value
-        LEFT_HIP       = PoseLandmark.LEFT_HIP.value
+        self.spin_time = QSpinBox()
+        self.spin_time.setRange(10, 600)
+        self.spin_time.setValue(180)
+        self.spin_time.setSuffix(" s")
+        form.addRow("Час попередж.:", self.spin_time)
 
-        # ── World-space coordinates (metres) ──────────────────────────────
-        l_shldr_wx = lm_world[LEFT_SHOULDER].x
-        l_shldr_wy = lm_world[LEFT_SHOULDER].y
-        l_shldr_wz = lm_world[LEFT_SHOULDER].z
-        r_shldr_wx = lm_world[RIGHT_SHOULDER].x
-        r_shldr_wy = lm_world[RIGHT_SHOULDER].y
-        r_shldr_wz = lm_world[RIGHT_SHOULDER].z
-        # Use midpoint of both ears to reduce bias from head rotation / camera angle
-        l_ear_wx   = lm_world[LEFT_EAR].x
-        l_ear_wy   = lm_world[LEFT_EAR].y
-        r_ear_wx   = lm_world[RIGHT_EAR].x
-        r_ear_wy   = lm_world[RIGHT_EAR].y
-        mid_ear_wx = (l_ear_wx + r_ear_wx) / 2.0
-        mid_ear_wy = (l_ear_wy + r_ear_wy) / 2.0
-        # Midpoint between shoulders — base of neck reference
-        mid_shldr_wx = (l_shldr_wx + r_shldr_wx) / 2.0
-        mid_shldr_wy = (l_shldr_wy + r_shldr_wy) / 2.0
-        l_hip_wx   = lm_world[LEFT_HIP].x
-        l_hip_wy   = lm_world[LEFT_HIP].y
+        settings_box.setLayout(form)
 
-        # ── Pixel coordinates (drawing only) ─────────────────────────────
-        l_shldr_x, l_shldr_y = px(LEFT_SHOULDER)
-        r_shldr_x, r_shldr_y = px(RIGHT_SHOULDER)
-        l_ear_x,   l_ear_y   = px(LEFT_EAR)
-        r_ear_x,   r_ear_y   = px(RIGHT_EAR)
-        mid_ear_px = ((l_ear_x + r_ear_x) // 2, (l_ear_y + r_ear_y) // 2)
-        mid_shldr_px = ((l_shldr_x + r_shldr_x) // 2, (l_shldr_y + r_shldr_y) // 2)
-        l_hip_x,   l_hip_y   = px(LEFT_HIP)
+        # ── Right panel ───────────────────────────────────────────────────
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(indicator_box)
+        right_panel.addLayout(time_layout)
+        right_panel.addWidget(self.chart_canvas)
+        right_panel.addWidget(ctrl_box)
+        right_panel.addWidget(settings_box)
+        right_panel.addStretch()
 
-        # Shoulder-to-shoulder distance in world space (metres).
-        # Large value = frontal view (both shoulders visible) — this is NORMAL.
-        # Small value = side view (one shoulder hidden behind the other).
-        offset = findDistance(l_shldr_wx, l_shldr_wy, r_shldr_wx, r_shldr_wy)
+        right_w = QWidget()
+        right_w.setLayout(right_panel)
+        right_w.setMaximumWidth(380)
 
-        # Average shoulder depth: negative z → leaning toward the camera.
-        shoulder_depth = (l_shldr_wz + r_shldr_wz) / 2.0
+        # ── Main layout ──────────────────────────────────────────────────
+        main_layout = QHBoxLayout()
+        left_videos = QHBoxLayout()
+        left_videos.addWidget(self.video_label, stretch=3)
+        left_videos.addWidget(self.side_video_label, stretch=1)
+        left_w = QWidget()
+        left_w.setLayout(left_videos)
 
-        # Show a warning only if offset is too small (side/profile view).
-        if offset >= offset_threshold:
-            cv2.putText(image, f'{offset:.2f} m  Frontal view OK', (w - 300, 30), font, 0.6, green, 2)
+        main_layout.addWidget(left_w, stretch=3)
+        main_layout.addWidget(right_w, stretch=1)
+        self.setLayout(main_layout)
+
+    # ── helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_light(color, size):
+        frame = QFrame()
+        frame.setFixedSize(size, size)
+        frame.setStyleSheet(
+            f"background: {color}; border-radius: {size // 2}px; border: 1px solid #555;"
+        )
+        return frame
+
+    def set_green(self):
+        self.green_light.setStyleSheet(
+            "background: #33ff33; border-radius: 15px; border: 1px solid #555;"
+        )
+        self.red_light.setStyleSheet(
+            "background: #6a2d2d; border-radius: 15px; border: 1px solid #555;"
+        )
+
+    def set_red(self):
+        self.green_light.setStyleSheet(
+            "background: #2d6a2d; border-radius: 15px; border: 1px solid #555;"
+        )
+        self.red_light.setStyleSheet(
+            "background: #ff3333; border-radius: 15px; border: 1px solid #555;"
+        )
+
+    # ── slots ─────────────────────────────────────────────────────────
+
+    def on_frame(self, qimage: 'QImage'):
+        pix = QPixmap.fromImage(qimage)
+        scaled = pix.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.video_label.setPixmap(scaled)
+
+    def on_side_frame(self, qimage: 'QImage'):
+        pix = QPixmap.fromImage(qimage)
+        scaled = pix.scaled(self.side_video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.side_video_label.setPixmap(scaled)
+
+    def on_metrics(self, data: dict):
+        cva = data.get('cva_2d', data.get('neck_angle', 0.0))
+        good = data['is_good_posture']
+        good_t = data['good_time']
+        bad_t = data['bad_time']
+
+        # Indicator
+        if good:
+            self.set_green()
+            self.status_label.setText("Правильна постава ✔")
+            self.status_label.setStyleSheet("color: #33ff33; font-size: 13px;")
         else:
-            cv2.putText(image, f'{offset:.2f} m  Side view detected', (w - 330, 30), font, 0.6, red, 2)
+            self.set_red()
+            parts = []
+            if data.get('is_leaning'):
+                parts.append("Нахил вперед")
+            if data.get('is_tilted'):
+                parts.append("Перекіс плечей")
+            if not parts:
+                parts.append("Погана постава")
+            self.status_label.setText(" | ".join(parts))
+            self.status_label.setStyleSheet("color: #ff4444; font-size: 13px;")
 
-        # ── Posture analysis (upper body only, frontal view) ─────────────────
+        # Time labels
+        self.good_time_label.setText(f"Good: {good_t:.1f} s")
+        self.bad_time_label.setText(f"Bad: {bad_t:.1f} s")
 
-        # Neck inclination: shoulder midpoint → ear midpoint, angle from vertical.
-        # Using midpoints of both shoulders and both ears eliminates left/right bias.
-        neck_inclination = findAngle(mid_shldr_wx, mid_shldr_wy, mid_ear_wx, mid_ear_wy)
+        # Chart (in-place redraw)
+        self._angle_buf.append(cva)
+        n = len(self._angle_buf)
+        fps = data.get('fps', 30)
+        self._time_buf.append(n / fps)
+        xs = list(self._time_buf)
+        ys = list(self._angle_buf)
+        self.chart_line.set_xdata(xs)
+        self.chart_line.set_ydata(ys)
+        self.chart_ax.set_xlim(xs[0], xs[-1] + 0.01)
+        y_min = min(ys) - 5
+        y_max = max(ys) + 5
+        self.chart_ax.set_ylim(y_min, y_max)
 
-        # Shoulder Y-asymmetry: |Δy| between left and right shoulder (metres).
-        # Non-zero value indicates one shoulder is raised/lowered — back tilt.
-        shoulder_tilt = abs(l_shldr_wy - r_shldr_wy)
-
-        # ── Status flags ──────────────────────────────────────────────────────
-        is_good_neck    = neck_inclination < neck_angle_threshold
-        is_leaning      = shoulder_depth   < -forward_lean_threshold   # z<0 = toward camera
-        is_tilted       = shoulder_tilt    >  shoulder_tilt_threshold
-
-        is_good_posture = is_good_neck and not is_leaning and not is_tilted
-
-        if is_good_posture:
-            good_frames += 1
-            bad_frames   = 0
+        # Threshold line
+        thresh = self.spin_neck.value()
+        if self.chart_threshold_line is None:
+            self.chart_threshold_line = self.chart_ax.axhline(
+                y=thresh, color='#ff5555', linestyle='--', linewidth=1, alpha=0.7
+            )
         else:
-            bad_frames  += 1
-            good_frames  = 0
+            self.chart_threshold_line.set_ydata([thresh, thresh])
 
-        # ── Draw upper-body skeleton (no hip / leg landmarks) ─────────────────
-        skel_color = green if is_good_posture else red
-        cv2.circle(image, (l_shldr_x,    l_shldr_y),    7, white, 2)
-        cv2.circle(image, (r_shldr_x,    r_shldr_y),    7, pink,  -1)
-        cv2.circle(image, mid_ear_px,                   7, white, 2)
-        cv2.circle(image, mid_shldr_px,                 5, yellow, -1)  # midpoint ref dot
-        # Shoulder bar — highlights tilt visually
-        cv2.line(image, (l_shldr_x, l_shldr_y), (r_shldr_x, r_shldr_y), skel_color, 2)
-        # Neck line: shoulder midpoint → ear midpoint
-        cv2.line(image, mid_shldr_px, mid_ear_px, skel_color, 2)
-        # Vertical reference from shoulder midpoint
-        cv2.line(image, mid_shldr_px, (mid_shldr_px[0], mid_shldr_px[1] - 100), skel_color, 2)
-        # Angle annotation next to midpoint
-        cv2.putText(image, f'{int(neck_inclination)}',
-                    (mid_shldr_px[0] + 10, mid_shldr_px[1]), font, 0.9,
-                    light_green if is_good_neck else red, 2)
+        self.chart_canvas.draw_idle()
 
-        # ── HUD: numeric metrics (top-left) ───────────────────────────────────
-        cv2.putText(image, f'Neck:  {int(neck_inclination)} deg', (10, 30),  font, 0.6,
-                    light_green if is_good_neck else red, 2)
-        cv2.putText(image, f'Tilt:  {shoulder_tilt * 100:.1f} cm',  (10, 60),  font, 0.6,
-                    light_green if not is_tilted else red, 2)
-        cv2.putText(image, f'Depth: {shoulder_depth:+.2f} m', (10, 90),  font, 0.6,
-                    light_green if not is_leaning else yellow, 2)
+        # Warning if bad posture > time_threshold
+        time_threshold = self.spin_time.value()
+        if bad_t > time_threshold and not self._warning_active:
+            self._warning_active = True
+            send_warning_beep()
+            self.window().setStyleSheet(
+                self.window().styleSheet() + " QMainWindow { border: 3px solid #ff3333; }"
+            )
+        elif good:
+            self._warning_active = False
+            mw = self.window()
+            if isinstance(mw, MainWindow):
+                mw.setStyleSheet(mw._base_style)
 
-        # ── HUD: Ukrainian status labels (rendered via PIL for Cyrillic) ───────
-        status_y     = 130
-        unicode_items = []
-        if is_good_posture:
-            unicode_items.append(((10, status_y), 'Правильна постава', 0.85, light_green))
-        else:
-            if is_leaning:
-                unicode_items.append(((10, status_y), 'Нахил вперед!', 0.85, yellow))
-                status_y += 40
-            if is_tilted:
-                unicode_items.append(((10, status_y), 'Перекіс плечей!', 0.85, red))
-        if unicode_items:
-            _draw_unicode_batch(image, unicode_items)
 
-        # Calculate the time of remaining in a particular posture.
-        good_time = (1 / fps) * good_frames
-        bad_time = (1 / fps) * bad_frames
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Analytics Tab
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        # Pose time.
-        if good_time > 0:
-            time_string_good = 'Good Posture Time : ' + str(round(float(good_time), 1)) + 's'
-            cv2.putText(image, time_string_good, (10, h - 20), font, 0.9, green, 2)
-        else:
-            time_string_bad = 'Bad Posture Time : ' + str(round(float(bad_time), 1)) + 's'
-            cv2.putText(image, time_string_bad, (10, h - 20), font, 0.9, red, 2)
+class AnalyticsTab(QWidget):
+    """Tab 2 — placeholder charts for future historical analytics."""
 
-        # If you stay in bad posture for more than the threshold, send an alert.
-        if bad_time > time_threshold:
-            sendWarning(bad_time)
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
-        # Show the frame.
-        cv2.imshow('MediaPipe Pose', image)
+        layout = QVBoxLayout()
 
-        # Exit the loop if 'q' is pressed OR the window's ✕ button is clicked.
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        if cv2.getWindowProperty('MediaPipe Pose', cv2.WND_PROP_VISIBLE) < 1:
-            break
+        title = QLabel("Аналітика сеансів")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #ddd; font-size: 18px; font-weight: bold; padding: 12px;")
+        layout.addWidget(title)
 
-    # Release the camera and close the windows.
-    landmarker.close()
-    cap.release()
-    cv2.destroyAllWindows()
+        info = QLabel(
+            "Тут будуть відображатися історичні дані після підключення бази SQLCipher."
+        )
+        info.setAlignment(Qt.AlignCenter)
+        info.setStyleSheet("color: #888; font-size: 13px; padding-bottom: 10px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # ── Pie chart placeholder ─────────────────────────────────────────
+        # TODO: підключити SQLCipher для зчитування даних сеансів.
+        # Цей Canvas буде показувати кругову діаграму:
+        #   - відсоток часу з правильною поставою vs поганою.
+        # Приклад запиту до БД:
+        #   SELECT SUM(good_time), SUM(bad_time) FROM sessions
+        #   WHERE date BETWEEN ? AND ?
+        pie_group = QGroupBox("Розподіл часу сеансу")
+        pie_group.setStyleSheet(
+            "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
+            "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
+            "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
+        )
+        self.pie_fig = Figure(figsize=(4, 3), dpi=80)
+        self.pie_fig.patch.set_facecolor('#1a1a2e')
+        self.pie_ax = self.pie_fig.add_subplot(111)
+        self.pie_ax.set_facecolor('#16213e')
+        self.pie_ax.text(0.5, 0.5, 'Дані відсутні',
+                         ha='center', va='center', color='#666', fontsize=14,
+                         transform=self.pie_ax.transAxes)
+        self.pie_canvas = FigureCanvas(self.pie_fig)
+        pie_layout = QVBoxLayout()
+        pie_layout.addWidget(self.pie_canvas)
+        pie_group.setLayout(pie_layout)
+        layout.addWidget(pie_group)
+
+        # ── Bar chart placeholder ─────────────────────────────────────────
+        # TODO: підключити SQLCipher для зчитування історії порушень.
+        # Цей Canvas буде показувати гістограму:
+        #   - кількість порушень постави по днях/годинах.
+        # Приклад запиту до БД:
+        #   SELECT DATE(timestamp), COUNT(*) FROM violations
+        #   GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) DESC LIMIT 30
+        bar_group = QGroupBox("Гістограма порушень")
+        bar_group.setStyleSheet(
+            "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
+            "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
+            "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
+        )
+        self.bar_fig = Figure(figsize=(4, 3), dpi=80)
+        self.bar_fig.patch.set_facecolor('#1a1a2e')
+        self.bar_ax = self.bar_fig.add_subplot(111)
+        self.bar_ax.set_facecolor('#16213e')
+        self.bar_ax.text(0.5, 0.5, 'Дані відсутні',
+                         ha='center', va='center', color='#666', fontsize=14,
+                         transform=self.bar_ax.transAxes)
+        self.bar_canvas = FigureCanvas(self.bar_fig)
+        bar_layout = QVBoxLayout()
+        bar_layout.addWidget(self.bar_canvas)
+        bar_group.setLayout(bar_layout)
+        layout.addWidget(bar_group)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Main Window
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+    """Top-level window with two tabs: Live Dashboard and Analytics."""
+
+    _base_style = """
+        QMainWindow { background: #0f0f23; }
+        QTabWidget::pane { border: 1px solid #333; background: #0f0f23; }
+        QTabBar::tab {
+            background: #16213e; color: #aaa; padding: 10px 28px;
+            border: 1px solid #333; border-bottom: none; border-radius: 6px 6px 0 0;
+            font-size: 13px; min-width: 140px;
+        }
+        QTabBar::tab:selected { background: #1a1a2e; color: #fff; font-weight: bold; }
+        QTabBar::tab:hover { background: #1a3a5c; }
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Posture Monitor")
+        self.resize(1200, 750)
+        self.setStyleSheet(self._base_style)
+
+        # ── Tabs ──────────────────────────────────────────────────────────
+        self.tabs = QTabWidget()
+        self.live_tab = LiveDashboardTab()
+        self.analytics_tab = AnalyticsTab()
+        self.tabs.addTab(self.live_tab, "📡  Live Dashboard")
+        self.tabs.addTab(self.analytics_tab, "📊  Analytics")
+        self.setCentralWidget(self.tabs)
+
+        # ── Worker (not started yet) ──────────────────────────────────────
+        self.worker = None
+
+        # ── Connect buttons ──────────────────────────────────────────────
+        self.live_tab.btn_start.clicked.connect(self._start_monitoring)
+        self.live_tab.btn_stop.clicked.connect(self._stop_monitoring)
+        self.live_tab.btn_calibrate.clicked.connect(self._start_calibrate)
+
+        # Push threshold changes to worker
+        self.live_tab.spin_neck.valueChanged.connect(self._push_thresholds)
+        self.live_tab.spin_tilt.valueChanged.connect(self._push_thresholds)
+        self.live_tab.spin_lean.valueChanged.connect(self._push_thresholds)
+        self.live_tab.spin_time.valueChanged.connect(self._push_thresholds)
+
+    # ── monitoring lifecycle ─────────────────────────────────────────
+
+    def _start_monitoring(self):
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.worker = PoseWorker(camera_front_id=0, camera_side_id=1)
+        self._push_thresholds()
+
+        self.worker.front_frame_ready.connect(self.live_tab.on_frame)
+        self.worker.side_frame_ready.connect(self.live_tab.on_side_frame)
+        self.worker.metrics_ready.connect(self.live_tab.on_metrics)
+        self.worker.finished.connect(self._on_worker_done)
+
+        self.worker.start()
+
+        self.live_tab.btn_start.setEnabled(False)
+        self.live_tab.btn_stop.setEnabled(True)
+        self.live_tab.btn_calibrate.setEnabled(True)
+        self.live_tab.video_label.setText("")
+        self.live_tab.side_video_label.setText("")
+
+    def _stop_monitoring(self):
+        if self.worker:
+            self.worker.stop()
+            self.worker.wait(5000)
+            self.worker = None
+
+        self.live_tab.btn_start.setEnabled(True)
+        self.live_tab.btn_stop.setEnabled(False)
+        self.live_tab.btn_calibrate.setEnabled(False)
+        self.live_tab.video_label.setText("Моніторинг зупинено")
+
+    def _on_worker_done(self):
+        self.live_tab.btn_start.setEnabled(True)
+        self.live_tab.btn_stop.setEnabled(False)
+        self.live_tab.btn_calibrate.setEnabled(False)
+
+    # ── calibration ──────────────────────────────────────────────────
+
+    def _start_calibrate(self):
+        if not self.worker or not self.worker.isRunning():
+            return
+        self.worker.start_calibration()
+        self.live_tab.calibrate_label.setText("Калібрування… Сядьте рівно (3 с)")
+        self.live_tab.btn_calibrate.setEnabled(False)
+        QTimer.singleShot(3000, self._finish_calibrate)
+
+    def _finish_calibrate(self):
+        if self.worker:
+            self.worker.finish_calibration()
+        self.live_tab.calibrate_label.setText("✔ Еталон зафіксовано")
+        self.live_tab.btn_calibrate.setEnabled(True)
+        QTimer.singleShot(2000, lambda: self.live_tab.calibrate_label.setText(""))
+
+    # ── push GUI thresholds to worker ────────────────────────────────
+
+    def _push_thresholds(self):
+        if not self.worker:
+            return
+        self.worker.set_thresholds(
+            neck_angle_threshold=self.live_tab.spin_neck.value(),
+            shoulder_tilt_threshold=self.live_tab.spin_tilt.value(),
+            forward_lean_threshold=self.live_tab.spin_lean.value(),
+            time_threshold=self.live_tab.spin_time.value(),
+        )
+
+    # ── cleanup ──────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        self._stop_monitoring()
+        event.accept()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+
+    # Dark palette for Fusion
+    from PyQt5.QtGui import QPalette
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(15, 15, 35))
+    palette.setColor(QPalette.WindowText, QColor(220, 220, 220))
+    palette.setColor(QPalette.Base, QColor(22, 33, 62))
+    palette.setColor(QPalette.AlternateBase, QColor(26, 26, 46))
+    palette.setColor(QPalette.Text, QColor(220, 220, 220))
+    palette.setColor(QPalette.Button, QColor(22, 33, 62))
+    palette.setColor(QPalette.ButtonText, QColor(220, 220, 220))
+    palette.setColor(QPalette.Highlight, QColor(0, 210, 255))
+    palette.setColor(QPalette.HighlightedText, QColor(0, 0, 0))
+    app.setPalette(palette)
+
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
-    args = parse_arguments()
-
-    print("Arguments:")
-    print(f"Video:                   {args.video}")
-    print(f"Offset Threshold:        {args.offset_threshold} m")
-    print(f"Neck Angle Threshold:    {args.neck_angle_threshold} deg")
-    print(f"Torso Angle Threshold:   {args.torso_angle_threshold} deg")
-    print(f"Shoulder Tilt Threshold: {args.shoulder_tilt_threshold} m")
-    print(f"Forward Lean Threshold:  {args.forward_lean_threshold} m")
-    print(f"Time Threshold:          {args.time_threshold} s")
-
-    main(
-        video_path=args.video,
-        offset_threshold=args.offset_threshold,
-        neck_angle_threshold=args.neck_angle_threshold,
-        torso_angle_threshold=args.torso_angle_threshold,
-        time_threshold=args.time_threshold,
-        shoulder_tilt_threshold=args.shoulder_tilt_threshold,
-        forward_lean_threshold=args.forward_lean_threshold,
-    )
+    main()
