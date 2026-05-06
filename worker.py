@@ -26,6 +26,7 @@ RIGHT_SHOULDER = 12
 LEFT_EAR = 7
 RIGHT_EAR = 8
 LEFT_HIP = 23
+NOSE = 0
 
 
 def _find_distance(x1, y1, x2, y2):
@@ -83,7 +84,7 @@ class PoseWorker(QThread):
         camera_front_id: int = 0,
         camera_side_id: int = 1,
         front_video_path: int = 0,
-        side_video_path: str = "http://192.168.1.100:8080/video",
+        side_video_path: str = "http://192.168.1.4:8080/video",
     ):
         super().__init__(parent)
         # Back-compat: video_path is treated as front input if provided.
@@ -97,6 +98,9 @@ class PoseWorker(QThread):
         # Thresholds (can be updated from GUI via set_thresholds)
         self.offset_threshold = 0.3
         self.medical_cva_threshold = 50.0
+        self.trunk_tilt_threshold_deg = 12.0
+        self.hunch_ratio_threshold = 0.35
+        self.bad_pose_timeout_s = 10.0
         self.shoulder_tilt_threshold = 0.05
         self.forward_lean_threshold = 0.10
         self.time_threshold = 180
@@ -152,8 +156,8 @@ class PoseWorker(QThread):
         )
         side_src = self.side_video_path if self.side_video_path is not None else self.camera_side_id
 
-        cap_front = cv2.VideoCapture(0)
-        cap_side = cv2.VideoCapture("http://192.168.1.4:8080/video")
+        cap_front = cv2.VideoCapture(front_src)
+        cap_side = cv2.VideoCapture(side_src)
 
         fps_front = cap_front.get(cv2.CAP_PROP_FPS) or 30.0
         fps_side = cap_side.get(cv2.CAP_PROP_FPS) or 30.0
@@ -163,8 +167,11 @@ class PoseWorker(QThread):
         bad_frames = 0
 
         cva_filter = None
+        trunk_filter = None
+        hunch_filter = None
         tilt_filter = None
         depth_filter = None
+        bad_since_s: float | None = None
 
         while self._running:
             ok_front, image_front = cap_front.read()
@@ -214,6 +221,7 @@ class PoseWorker(QThread):
             RS = RIGHT_SHOULDER
             LE = LEFT_EAR
             RE = RIGHT_EAR
+            NS = NOSE
 
             shoulder_depth = (lm_world_f[LS].z + lm_world_f[RS].z) / 2.0
             shoulder_tilt = abs(lm_world_f[LS].y - lm_world_f[RS].y)
@@ -224,6 +232,11 @@ class PoseWorker(QThread):
                 self._emit_side_frame(image_side, hs, ws)
                 continue
 
+            # Trunk tilt (frontal): angle between vertical axis and vector from mid-shoulders -> nose
+            trunk_tilt_deg = self._calculate_trunk_tilt_deg(lm_norm_f, wf, hf)
+            # Hunch ratio (frontal): normalized vertical distance ear->shoulder by shoulder width
+            hunch_ratio = self._calculate_hunch_ratio(lm_norm_f, wf, hf)
+
             # One Euro Filter
             t = timestamp_ms / 1000.0
             if cva_filter is None:
@@ -233,18 +246,39 @@ class PoseWorker(QThread):
                     min_cutoff=self.filter_min_cutoff,
                     beta=self.filter_beta,
                 )
+                if trunk_tilt_deg is not None:
+                    trunk_filter = OneEuroFilter(
+                        t,
+                        trunk_tilt_deg,
+                        min_cutoff=self.filter_min_cutoff,
+                        beta=self.filter_beta,
+                    )
+                if hunch_ratio is not None:
+                    hunch_filter = OneEuroFilter(
+                        t,
+                        hunch_ratio,
+                        min_cutoff=self.filter_min_cutoff,
+                        beta=self.filter_beta,
+                    )
                 tilt_filter = OneEuroFilter(t, shoulder_tilt,
                                             min_cutoff=self.filter_min_cutoff, beta=self.filter_beta)
                 depth_filter = OneEuroFilter(t, shoulder_depth,
                                              min_cutoff=self.filter_min_cutoff, beta=self.filter_beta)
             else:
                 raw_cva_2d = float(cva_filter(t, raw_cva_2d))
+                if trunk_tilt_deg is not None and trunk_filter is not None:
+                    trunk_tilt_deg = float(trunk_filter(t, trunk_tilt_deg))
+                if hunch_ratio is not None and hunch_filter is not None:
+                    hunch_ratio = float(hunch_filter(t, hunch_ratio))
                 shoulder_tilt = float(tilt_filter(t, shoulder_tilt))
                 shoulder_depth = float(depth_filter(t, shoulder_depth))
 
             # Read thresholds
             self._mutex.lock()
             cva_limit = self.medical_cva_threshold
+            trunk_limit = self.trunk_tilt_threshold_deg
+            hunch_limit = self.hunch_ratio_threshold
+            bad_timeout = self.bad_pose_timeout_s
             fl = self.forward_lean_threshold
             st = self.shoulder_tilt_threshold
             tt = self.time_threshold
@@ -253,7 +287,22 @@ class PoseWorker(QThread):
             is_good_neck = raw_cva_2d >= cva_limit
             is_leaning = shoulder_depth < -fl
             is_tilted = shoulder_tilt > st
-            is_good_posture = is_good_neck and not is_leaning and not is_tilted
+            is_trunk_tilted = (trunk_tilt_deg is not None) and (trunk_tilt_deg > trunk_limit)
+            is_hunched = (hunch_ratio is not None) and (hunch_ratio < hunch_limit)
+
+            # Instant (raw) assessment
+            is_bad_instant = (not is_good_neck) or is_leaning or is_tilted or is_trunk_tilted or is_hunched
+
+            now_s = time.monotonic()
+            if is_bad_instant:
+                if bad_since_s is None:
+                    bad_since_s = now_s
+            else:
+                bad_since_s = None
+
+            bad_elapsed_s = (now_s - bad_since_s) if bad_since_s is not None else 0.0
+            is_bad_confirmed = (bad_since_s is not None) and (bad_elapsed_s >= bad_timeout)
+            is_good_posture = not is_bad_confirmed
 
             if is_good_posture:
                 good_frames += 1
@@ -281,6 +330,26 @@ class PoseWorker(QThread):
                         light_green if not is_tilted else red, 2)
             cv2.putText(image_front, f'Depth:{shoulder_depth:+.2f} m', (10, 90), font, 0.6,
                         light_green if not is_leaning else yellow, 2)
+            if trunk_tilt_deg is not None:
+                cv2.putText(
+                    image_front,
+                    f'Trunk: {trunk_tilt_deg:.1f} deg',
+                    (10, 120),
+                    font,
+                    0.6,
+                    light_green if not is_trunk_tilted else yellow,
+                    2,
+                )
+            if hunch_ratio is not None:
+                cv2.putText(
+                    image_front,
+                    f'Hunch: {hunch_ratio:.2f}',
+                    (10, 150),
+                    font,
+                    0.6,
+                    light_green if not is_hunched else yellow,
+                    2,
+                )
 
             # Side overlay (CVA + points)
             side_pts = self._get_side_cva_points(lm_norm_s, ws, hs)
@@ -308,11 +377,19 @@ class PoseWorker(QThread):
             if is_good_posture:
                 items.append(((10, status_y), 'Правильна постава', 0.85, light_green))
             else:
-                if is_leaning:
-                    items.append(((10, status_y), 'Нахил вперед!', 0.85, yellow))
-                    status_y += 40
-                if is_tilted:
-                    items.append(((10, status_y), 'Перекіс плечей!', 0.85, red))
+                # Show warnings only after the time filter confirms a bad pose.
+                if is_bad_confirmed:
+                    if is_trunk_tilted:
+                        items.append(((10, status_y), 'Бічний нахил тулуба!', 0.85, yellow))
+                        status_y += 40
+                    if is_hunched:
+                        items.append(((10, status_y), 'Згорбленість (підняті плечі)!', 0.85, yellow))
+                        status_y += 40
+                    if is_leaning:
+                        items.append(((10, status_y), 'Нахил вперед!', 0.85, yellow))
+                        status_y += 40
+                    if is_tilted:
+                        items.append(((10, status_y), 'Перекіс плечей!', 0.85, red))
             if items:
                 _draw_unicode_batch(image_front, items)
 
@@ -323,6 +400,16 @@ class PoseWorker(QThread):
                 'cva_2d': raw_cva_2d,
                 'raw_cva_2d': raw_cva_2d,
                 'cva_threshold': cva_limit,
+                'trunk_tilt_deg': trunk_tilt_deg,
+                'trunk_tilt_threshold': trunk_limit,
+                'is_trunk_tilted': is_trunk_tilted,
+                'hunch_ratio': hunch_ratio,
+                'hunch_ratio_threshold': hunch_limit,
+                'is_hunched': is_hunched,
+                'is_bad_instant': is_bad_instant,
+                'is_bad_confirmed': is_bad_confirmed,
+                'bad_elapsed_s': bad_elapsed_s,
+                'bad_timeout_s': bad_timeout,
                 'shoulder_tilt': shoulder_tilt,
                 'shoulder_depth': shoulder_depth,
                 'is_good_posture': is_good_posture,
@@ -408,3 +495,76 @@ class PoseWorker(QThread):
             return None
 
         return (ear_x, ear_y), (sh_x, sh_y)
+
+    @staticmethod
+    def _calculate_trunk_tilt_deg(landmarks, width: int, height: int) -> float | None:
+        """
+        Trunk lateral tilt (frontal view): deviation of the spine line from
+        the absolute vertical axis of the camera.
+
+        Uses mid-point between shoulders as the lower point and the nose as the
+        upper point. Returns degrees (0..90).
+        """
+        try:
+            ls = landmarks[LEFT_SHOULDER]
+            rs = landmarks[RIGHT_SHOULDER]
+            nose = landmarks[NOSE]
+        except Exception:
+            return None
+
+        ls_x, ls_y = float(ls.x) * width, float(ls.y) * height
+        rs_x, rs_y = float(rs.x) * width, float(rs.y) * height
+        nose_x, nose_y = float(nose.x) * width, float(nose.y) * height
+
+        if not all(m.isfinite(v) for v in (ls_x, ls_y, rs_x, rs_y, nose_x, nose_y)):
+            return None
+
+        mid_x = (ls_x + rs_x) / 2.0
+        mid_y = (ls_y + rs_y) / 2.0
+
+        dx = nose_x - mid_x
+        dy = mid_y - nose_y  # positive if nose above shoulders
+        if dx == 0 and dy == 0:
+            return None
+
+        # Angle between vertical axis and the vector mid->nose
+        # 0° when aligned with vertical, increases with lateral lean.
+        angle = m.degrees(m.atan2(abs(dx), abs(dy)))
+        return float(angle)
+
+    @staticmethod
+    def _calculate_hunch_ratio(landmarks, width: int, height: int) -> float | None:
+        """
+        Hunch (shrug/neck tuck) proxy from frontal view.
+
+        Compute normalized vertical distance ear->shoulder:
+            ratio = (shoulder_y - ear_y) / shoulder_width_px
+        Smaller ratio => ear is closer to shoulder in Y => more "hunched".
+        """
+        try:
+            le = landmarks[LEFT_EAR]
+            re = landmarks[RIGHT_EAR]
+            ls = landmarks[LEFT_SHOULDER]
+            rs = landmarks[RIGHT_SHOULDER]
+        except Exception:
+            return None
+
+        ls_x, ls_y = float(ls.x) * width, float(ls.y) * height
+        rs_x, rs_y = float(rs.x) * width, float(rs.y) * height
+        le_y = float(le.y) * height
+        re_y = float(re.y) * height
+
+        if not all(m.isfinite(v) for v in (ls_x, ls_y, rs_x, rs_y, le_y, re_y)):
+            return None
+
+        shoulder_w = abs(ls_x - rs_x)
+        if shoulder_w < 1.0:
+            return None
+
+        # Use the more visible ear/shoulder side
+        use_left = getattr(le, "visibility", 0.0) >= getattr(re, "visibility", 0.0)
+        ear_y = le_y if use_left else re_y
+        sh_y = ls_y if use_left else rs_y
+
+        dy = sh_y - ear_y  # positive when ear is above shoulder
+        return float(dy / shoulder_w)

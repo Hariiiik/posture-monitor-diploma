@@ -165,7 +165,7 @@ class LiveDashboardTab(QWidget):
 
         self.spin_neck = QSpinBox()
         self.spin_neck.setRange(5, 60)
-        self.spin_neck.setValue(25)
+        self.spin_neck.setValue(50)
         self.spin_neck.setSuffix(" °")
         form.addRow("Кут шиї:", self.spin_neck)
 
@@ -432,8 +432,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.live_tab = LiveDashboardTab()
         self.analytics_tab = AnalyticsTab()
-        self.tabs.addTab(self.live_tab, "📡  Live Dashboard")
-        self.tabs.addTab(self.analytics_tab, "📊  Analytics")
+        self.tabs.addTab(self.live_tab, "Live Dashboard")
+        self.tabs.addTab(self.analytics_tab, "Analytics")
         self.setCentralWidget(self.tabs)
 
         # ── Worker (not started yet) ──────────────────────────────────────
@@ -442,7 +442,8 @@ class MainWindow(QMainWindow):
         # ── Connect buttons ──────────────────────────────────────────────
         self.live_tab.btn_start.clicked.connect(self._start_monitoring)
         self.live_tab.btn_stop.clicked.connect(self._stop_monitoring)
-        self.live_tab.btn_calibrate.clicked.connect(self._start_calibrate)
+        # Calibration removed from worker; keep the button disabled.
+        self.live_tab.btn_calibrate.setEnabled(False)
 
         # Push threshold changes to worker
         self.live_tab.spin_neck.valueChanged.connect(self._push_thresholds)
@@ -488,30 +489,13 @@ class MainWindow(QMainWindow):
         self.live_tab.btn_stop.setEnabled(False)
         self.live_tab.btn_calibrate.setEnabled(False)
 
-    # ── calibration ──────────────────────────────────────────────────
-
-    def _start_calibrate(self):
-        if not self.worker or not self.worker.isRunning():
-            return
-        self.worker.start_calibration()
-        self.live_tab.calibrate_label.setText("Калібрування… Сядьте рівно (3 с)")
-        self.live_tab.btn_calibrate.setEnabled(False)
-        QTimer.singleShot(3000, self._finish_calibrate)
-
-    def _finish_calibrate(self):
-        if self.worker:
-            self.worker.finish_calibration()
-        self.live_tab.calibrate_label.setText("✔ Еталон зафіксовано")
-        self.live_tab.btn_calibrate.setEnabled(True)
-        QTimer.singleShot(2000, lambda: self.live_tab.calibrate_label.setText(""))
-
     # ── push GUI thresholds to worker ────────────────────────────────
 
     def _push_thresholds(self):
         if not self.worker:
             return
         self.worker.set_thresholds(
-            neck_angle_threshold=self.live_tab.spin_neck.value(),
+            medical_cva_threshold=float(self.live_tab.spin_neck.value()),
             shoulder_tilt_threshold=self.live_tab.spin_tilt.value(),
             forward_lean_threshold=self.live_tab.spin_lean.value(),
             time_threshold=self.live_tab.spin_time.value(),
