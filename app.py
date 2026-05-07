@@ -9,19 +9,15 @@ Main window with two tabs:
 import sys
 import math
 import numpy as np
-from collections import deque
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QGroupBox, QSpinBox, QDoubleSpinBox,
-    QFormLayout, QSizePolicy, QMessageBox,
+    QGroupBox, QSpinBox, QDoubleSpinBox,
+    QFormLayout, QGridLayout,
 )
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QPixmap, QFont, QColor
-
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
+from PyQt5.QtGui import QImage, QPixmap, QFont, QColor
 
 from worker import PoseWorker
 
@@ -47,20 +43,43 @@ def send_warning_beep(duration_ms=500, freq=800):
 #  Live Dashboard Tab
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Pastel color constants ────────────────────────────────────────────────────
+PASTEL_GREEN_BG = "#c8f7c5"       # card background when OK
+PASTEL_GREEN_BORDER = "#7bc67e"   # card border when OK
+PASTEL_GREEN_TEXT = "#2d6a2d"     # card text when OK
+
+PASTEL_RED_BG = "#f7c5c5"         # card background when bad
+PASTEL_RED_BORDER = "#c66e6e"     # card border when bad
+PASTEL_RED_TEXT = "#8b2222"       # card text when bad
+
+PASTEL_YELLOW_BG = "#fdf3c5"      # card background for warning
+PASTEL_YELLOW_BORDER = "#d4b84a"  # card border for warning
+PASTEL_YELLOW_TEXT = "#7a6a1a"    # card text for warning
+
+DORMANT_BG = "#1e2a3a"            # card background when idle
+DORMANT_BORDER = "#333"           # card border when idle
+DORMANT_TEXT = "#888"             # card text when idle
+
+
+def _card_style(bg, border, text_color):
+    return (
+        f"background: {bg}; border: 2px solid {border}; border-radius: 10px; "
+        f"padding: 10px; color: {text_color}; font-size: 13px; font-weight: bold;"
+    )
+
+
 class LiveDashboardTab(QWidget):
-    """Tab 1 — real-time video feed, neck-angle chart, indicators, controls."""
+    """Tab 1 — real-time video feed, status cards, controls."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._angle_buf = deque(maxlen=300)
-        self._time_buf = deque(maxlen=300)
         self._warning_active = False
         self._calibrating = False
 
         # ── Video widget ──────────────────────────────────────────────────
         self.video_label = QLabel("Натисніть «Start Monitoring» для початку")
-        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setMinimumSize(640, 480)
         self.video_label.setStyleSheet(
             "background: #1a1a2e; color: #888; border: 2px solid #333; border-radius: 8px;"
@@ -68,52 +87,61 @@ class LiveDashboardTab(QWidget):
 
         # ── Side (picture-in-picture) video widget ────────────────────────
         self.side_video_label = QLabel("")
-        self.side_video_label.setAlignment(Qt.AlignCenter)
+        self.side_video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.side_video_label.setMinimumSize(320, 240)
         self.side_video_label.setMaximumSize(360, 270)
         self.side_video_label.setStyleSheet(
             "background: #111827; color: #888; border: 2px solid #333; border-radius: 8px;"
         )
 
-        # ── Matplotlib chart (in-place redraw) ────────────────────────────
-        self.chart_fig = Figure(figsize=(6, 2.2), dpi=80)
-        self.chart_fig.patch.set_facecolor('#1a1a2e')
-        self.chart_ax = self.chart_fig.add_subplot(111)
-        self.chart_ax.set_facecolor('#16213e')
-        self.chart_ax.set_ylabel('2D CVA °', color='#aaa', fontsize=9)
-        self.chart_ax.tick_params(colors='#888', labelsize=8)
-        for spine in self.chart_ax.spines.values():
-            spine.set_color('#333')
-        self.chart_line, = self.chart_ax.plot([], [], color='#00d2ff', linewidth=1.5)
-        self.chart_threshold_line = None  # drawn once we know threshold
-        self.chart_canvas = FigureCanvas(self.chart_fig)
-        self.chart_canvas.setMinimumHeight(150)
-
-        # ── Traffic-light indicators ──────────────────────────────────────
-        indicator_box = QGroupBox("Стан")
-        indicator_box.setStyleSheet(
+        # ── Status indicator cards ─────────────────────────────────────────
+        cards_box = QGroupBox("Стан постави")
+        cards_box.setStyleSheet(
             "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
-            "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
+            "margin-top: 10px; padding-top: 18px; font-weight: bold; }"
             "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
         )
-        ind_layout = QHBoxLayout()
-        self.green_light = self._make_light('#2d6a2d', 30)
-        self.red_light = self._make_light('#6a2d2d', 30)
-        self.status_label = QLabel("—")
-        self.status_label.setStyleSheet("color: #aaa; font-size: 13px;")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        ind_layout.addWidget(self.green_light)
-        ind_layout.addWidget(self.red_light)
-        ind_layout.addWidget(self.status_label)
-        indicator_box.setLayout(ind_layout)
+        cards_grid = QGridLayout()
+        cards_grid.setSpacing(8)
+
+        dormant = _card_style(DORMANT_BG, DORMANT_BORDER, DORMANT_TEXT)
+
+        self.card_posture = QLabel("Постава\n—")
+        self.card_posture.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.card_posture.setMinimumHeight(62)
+        self.card_posture.setStyleSheet(dormant)
+
+        self.card_trunk = QLabel("Нахил тулуба\n—")
+        self.card_trunk.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.card_trunk.setMinimumHeight(62)
+        self.card_trunk.setStyleSheet(dormant)
+
+        self.card_shoulders = QLabel("Плечі\n—")
+        self.card_shoulders.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.card_shoulders.setMinimumHeight(62)
+        self.card_shoulders.setStyleSheet(dormant)
+
+        self.card_neck = QLabel("Шия\n—")
+        self.card_neck.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.card_neck.setMinimumHeight(62)
+        self.card_neck.setStyleSheet(dormant)
+
+        cards_grid.addWidget(self.card_posture, 0, 0)
+        cards_grid.addWidget(self.card_trunk, 0, 1)
+        cards_grid.addWidget(self.card_shoulders, 1, 0)
+        cards_grid.addWidget(self.card_neck, 1, 1)
+        cards_box.setLayout(cards_grid)
 
         # ── Time labels ───────────────────────────────────────────────────
-        self.good_time_label = QLabel("Good: 0.0 s")
-        self.good_time_label.setStyleSheet("color: #7fff7f; font-size: 12px;")
-        self.bad_time_label = QLabel("Bad: 0.0 s")
-        self.bad_time_label.setStyleSheet("color: #ff7f7f; font-size: 12px;")
+        self.good_time_label = QLabel("✔ 0.0 s")
+        self.good_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.good_time_label.setStyleSheet(f"color: {PASTEL_GREEN_TEXT}; background: {PASTEL_GREEN_BG}; border-radius: 6px; padding: 4px; font-size: 12px; font-weight: bold;")
+        self.bad_time_label = QLabel("✖ 0.0 s")
+        self.bad_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.bad_time_label.setStyleSheet(f"color: {PASTEL_RED_TEXT}; background: {PASTEL_RED_BG}; border-radius: 6px; padding: 4px; font-size: 12px; font-weight: bold;")
 
         time_layout = QHBoxLayout()
+        time_layout.setSpacing(8)
         time_layout.addWidget(self.good_time_label)
         time_layout.addWidget(self.bad_time_label)
 
@@ -140,7 +168,7 @@ class LiveDashboardTab(QWidget):
 
         self.calibrate_label = QLabel("")
         self.calibrate_label.setStyleSheet("color: #ffcc00; font-size: 12px;")
-        self.calibrate_label.setAlignment(Qt.AlignCenter)
+        self.calibrate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         ctrl_layout = QHBoxLayout()
         ctrl_layout.addWidget(self.btn_start)
@@ -193,9 +221,8 @@ class LiveDashboardTab(QWidget):
 
         # ── Right panel ───────────────────────────────────────────────────
         right_panel = QVBoxLayout()
-        right_panel.addWidget(indicator_box)
+        right_panel.addWidget(cards_box)
         right_panel.addLayout(time_layout)
-        right_panel.addWidget(self.chart_canvas)
         right_panel.addWidget(ctrl_box)
         right_panel.addWidget(settings_box)
         right_panel.addStretch()
@@ -218,103 +245,88 @@ class LiveDashboardTab(QWidget):
 
     # ── helpers ───────────────────────────────────────────────────────
 
-    @staticmethod
-    def _make_light(color, size):
-        frame = QFrame()
-        frame.setFixedSize(size, size)
-        frame.setStyleSheet(
-            f"background: {color}; border-radius: {size // 2}px; border: 1px solid #555;"
-        )
-        return frame
+    def _set_card_ok(self, card, label, value_text):
+        card.setText(f"{label}\n{value_text}")
+        card.setStyleSheet(_card_style(PASTEL_GREEN_BG, PASTEL_GREEN_BORDER, PASTEL_GREEN_TEXT))
 
-    def set_green(self):
-        self.green_light.setStyleSheet(
-            "background: #33ff33; border-radius: 15px; border: 1px solid #555;"
-        )
-        self.red_light.setStyleSheet(
-            "background: #6a2d2d; border-radius: 15px; border: 1px solid #555;"
-        )
+    def _set_card_bad(self, card, label, value_text):
+        card.setText(f"{label}\n{value_text}")
+        card.setStyleSheet(_card_style(PASTEL_RED_BG, PASTEL_RED_BORDER, PASTEL_RED_TEXT))
 
-    def set_red(self):
-        self.green_light.setStyleSheet(
-            "background: #2d6a2d; border-radius: 15px; border: 1px solid #555;"
-        )
-        self.red_light.setStyleSheet(
-            "background: #ff3333; border-radius: 15px; border: 1px solid #555;"
-        )
+    def _set_card_warn(self, card, label, value_text):
+        card.setText(f"{label}\n{value_text}")
+        card.setStyleSheet(_card_style(PASTEL_YELLOW_BG, PASTEL_YELLOW_BORDER, PASTEL_YELLOW_TEXT))
 
     # ── slots ─────────────────────────────────────────────────────────
 
-    def on_frame(self, qimage: 'QImage'):
+    def on_frame(self, qimage: QImage):
         pix = QPixmap.fromImage(qimage)
-        scaled = pix.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = pix.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)  # type: ignore[arg-type]
         self.video_label.setPixmap(scaled)
 
-    def on_side_frame(self, qimage: 'QImage'):
+    def on_side_frame(self, qimage: QImage):
         pix = QPixmap.fromImage(qimage)
-        scaled = pix.scaled(self.side_video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = pix.scaled(self.side_video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)  # type: ignore[arg-type]
         self.side_video_label.setPixmap(scaled)
 
     def on_metrics(self, data: dict):
-        cva = data.get('cva_2d', data.get('neck_angle', 0.0))
+        cva = data.get('cva_2d') or data.get('neck_angle') or 0.0
         good = data['is_good_posture']
         good_t = data['good_time']
         bad_t = data['bad_time']
 
-        # Indicator
+        is_leaning = data.get('is_leaning', False)
+        is_tilted = data.get('is_tilted', False)
+        is_trunk_tilted = data.get('is_trunk_tilted', False)
+        is_hunched = data.get('is_hunched', False)
+        is_good_neck = cva >= self.spin_neck.value()
+        shoulder_tilt = data.get('shoulder_tilt', 0)
+        shoulder_depth = data.get('shoulder_depth', 0)
+        trunk_tilt_deg = data.get('trunk_tilt_deg')
+        hunch_ratio = data.get('hunch_ratio')
+
+        # ── Card: Постава (overall) ──────────────────────────────────
         if good:
-            self.set_green()
-            self.status_label.setText("Правильна постава ✔")
-            self.status_label.setStyleSheet("color: #33ff33; font-size: 13px;")
+            self._set_card_ok(self.card_posture, "Постава", "Правильна ✔")
         else:
-            self.set_red()
-            parts = []
-            if data.get('is_leaning'):
-                parts.append("Нахил вперед")
-            if data.get('is_tilted'):
-                parts.append("Перекіс плечей")
-            if not parts:
-                parts.append("Погана постава")
-            self.status_label.setText(" | ".join(parts))
-            self.status_label.setStyleSheet("color: #ff4444; font-size: 13px;")
+            self._set_card_bad(self.card_posture, "Постава", "Погана ✖")
+
+        # ── Card: Нахил тулуба ───────────────────────────────────────
+        if is_leaning:
+            self._set_card_bad(self.card_trunk, "Нахил тулуба", f"Нахил вперед ({shoulder_depth:+.2f} m)")
+        elif is_trunk_tilted:
+            self._set_card_warn(self.card_trunk, "Нахил тулуба", f"Бічний ({trunk_tilt_deg:.1f}°)" if trunk_tilt_deg else "Бічний нахил")
+        else:
+            self._set_card_ok(self.card_trunk, "Нахил тулуба", "Норма ✔")
+
+        # ── Card: Плечі ──────────────────────────────────────────────
+        if is_tilted:
+            self._set_card_bad(self.card_shoulders, "Плечі", f"Перекіс ({shoulder_tilt*100:.1f} см)")
+        elif is_hunched:
+            self._set_card_warn(self.card_shoulders, "Плечі", f"Підняті ({hunch_ratio:.2f})" if hunch_ratio else "Підняті")
+        else:
+            self._set_card_ok(self.card_shoulders, "Плечі", "Норма ✔")
+
+        # ── Card: Шия ────────────────────────────────────────────────
+        if not is_good_neck:
+            self._set_card_bad(self.card_neck, "Шия", f"Висунута ({cva:.1f}°)")
+        else:
+            self._set_card_ok(self.card_neck, "Шия", f"Норма ({cva:.1f}°)")
 
         # Time labels
-        self.good_time_label.setText(f"Good: {good_t:.1f} s")
-        self.bad_time_label.setText(f"Bad: {bad_t:.1f} s")
-
-        # Chart (in-place redraw)
-        self._angle_buf.append(cva)
-        n = len(self._angle_buf)
-        fps = data.get('fps', 30)
-        self._time_buf.append(n / fps)
-        xs = list(self._time_buf)
-        ys = list(self._angle_buf)
-        self.chart_line.set_xdata(xs)
-        self.chart_line.set_ydata(ys)
-        self.chart_ax.set_xlim(xs[0], xs[-1] + 0.01)
-        y_min = min(ys) - 5
-        y_max = max(ys) + 5
-        self.chart_ax.set_ylim(y_min, y_max)
-
-        # Threshold line
-        thresh = self.spin_neck.value()
-        if self.chart_threshold_line is None:
-            self.chart_threshold_line = self.chart_ax.axhline(
-                y=thresh, color='#ff5555', linestyle='--', linewidth=1, alpha=0.7
-            )
-        else:
-            self.chart_threshold_line.set_ydata([thresh, thresh])
-
-        self.chart_canvas.draw_idle()
+        self.good_time_label.setText(f"✔ {good_t:.1f} s")
+        self.bad_time_label.setText(f"✖ {bad_t:.1f} s")
 
         # Warning if bad posture > time_threshold
         time_threshold = self.spin_time.value()
         if bad_t > time_threshold and not self._warning_active:
             self._warning_active = True
             send_warning_beep()
-            self.window().setStyleSheet(
-                self.window().styleSheet() + " QMainWindow { border: 3px solid #ff3333; }"
-            )
+            mw = self.window()
+            if mw is not None:
+                mw.setStyleSheet(
+                    mw.styleSheet() + " QMainWindow { border: 3px solid #ff3333; }"
+                )
         elif good:
             self._warning_active = False
             mw = self.window()
@@ -335,67 +347,49 @@ class AnalyticsTab(QWidget):
         layout = QVBoxLayout()
 
         title = QLabel("Аналітика сеансів")
-        title.setAlignment(Qt.AlignCenter)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("color: #ddd; font-size: 18px; font-weight: bold; padding: 12px;")
         layout.addWidget(title)
 
         info = QLabel(
             "Тут будуть відображатися історичні дані після підключення бази SQLCipher."
         )
-        info.setAlignment(Qt.AlignCenter)
+        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         info.setStyleSheet("color: #888; font-size: 13px; padding-bottom: 10px;")
         info.setWordWrap(True)
         layout.addWidget(info)
 
         # ── Pie chart placeholder ─────────────────────────────────────────
         # TODO: підключити SQLCipher для зчитування даних сеансів.
-        # Цей Canvas буде показувати кругову діаграму:
-        #   - відсоток часу з правильною поставою vs поганою.
-        # Приклад запиту до БД:
-        #   SELECT SUM(good_time), SUM(bad_time) FROM sessions
-        #   WHERE date BETWEEN ? AND ?
         pie_group = QGroupBox("Розподіл часу сеансу")
         pie_group.setStyleSheet(
             "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
             "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
             "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
         )
-        self.pie_fig = Figure(figsize=(4, 3), dpi=80)
-        self.pie_fig.patch.set_facecolor('#1a1a2e')
-        self.pie_ax = self.pie_fig.add_subplot(111)
-        self.pie_ax.set_facecolor('#16213e')
-        self.pie_ax.text(0.5, 0.5, 'Дані відсутні',
-                         ha='center', va='center', color='#666', fontsize=14,
-                         transform=self.pie_ax.transAxes)
-        self.pie_canvas = FigureCanvas(self.pie_fig)
+        pie_placeholder = QLabel("Дані відсутні")
+        pie_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pie_placeholder.setMinimumHeight(150)
+        pie_placeholder.setStyleSheet("color: #666; font-size: 14px; background: #16213e; border-radius: 6px;")
         pie_layout = QVBoxLayout()
-        pie_layout.addWidget(self.pie_canvas)
+        pie_layout.addWidget(pie_placeholder)
         pie_group.setLayout(pie_layout)
         layout.addWidget(pie_group)
 
         # ── Bar chart placeholder ─────────────────────────────────────────
         # TODO: підключити SQLCipher для зчитування історії порушень.
-        # Цей Canvas буде показувати гістограму:
-        #   - кількість порушень постави по днях/годинах.
-        # Приклад запиту до БД:
-        #   SELECT DATE(timestamp), COUNT(*) FROM violations
-        #   GROUP BY DATE(timestamp) ORDER BY DATE(timestamp) DESC LIMIT 30
         bar_group = QGroupBox("Гістограма порушень")
         bar_group.setStyleSheet(
             "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
             "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
             "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
         )
-        self.bar_fig = Figure(figsize=(4, 3), dpi=80)
-        self.bar_fig.patch.set_facecolor('#1a1a2e')
-        self.bar_ax = self.bar_fig.add_subplot(111)
-        self.bar_ax.set_facecolor('#16213e')
-        self.bar_ax.text(0.5, 0.5, 'Дані відсутні',
-                         ha='center', va='center', color='#666', fontsize=14,
-                         transform=self.bar_ax.transAxes)
-        self.bar_canvas = FigureCanvas(self.bar_fig)
+        bar_placeholder = QLabel("Дані відсутні")
+        bar_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bar_placeholder.setMinimumHeight(150)
+        bar_placeholder.setStyleSheet("color: #666; font-size: 14px; background: #16213e; border-radius: 6px;")
         bar_layout = QVBoxLayout()
-        bar_layout.addWidget(self.bar_canvas)
+        bar_layout.addWidget(bar_placeholder)
         bar_group.setLayout(bar_layout)
         layout.addWidget(bar_group)
 
@@ -440,16 +434,16 @@ class MainWindow(QMainWindow):
         self.worker = None
 
         # ── Connect buttons ──────────────────────────────────────────────
-        self.live_tab.btn_start.clicked.connect(self._start_monitoring)
-        self.live_tab.btn_stop.clicked.connect(self._stop_monitoring)
+        self.live_tab.btn_start.clicked.connect(self._start_monitoring)  # type: ignore[attr-defined]
+        self.live_tab.btn_stop.clicked.connect(self._stop_monitoring)  # type: ignore[attr-defined]
         # Calibration removed from worker; keep the button disabled.
         self.live_tab.btn_calibrate.setEnabled(False)
 
         # Push threshold changes to worker
-        self.live_tab.spin_neck.valueChanged.connect(self._push_thresholds)
-        self.live_tab.spin_tilt.valueChanged.connect(self._push_thresholds)
-        self.live_tab.spin_lean.valueChanged.connect(self._push_thresholds)
-        self.live_tab.spin_time.valueChanged.connect(self._push_thresholds)
+        self.live_tab.spin_neck.valueChanged.connect(self._push_thresholds)  # type: ignore[attr-defined]
+        self.live_tab.spin_tilt.valueChanged.connect(self._push_thresholds)  # type: ignore[attr-defined]
+        self.live_tab.spin_lean.valueChanged.connect(self._push_thresholds)  # type: ignore[attr-defined]
+        self.live_tab.spin_time.valueChanged.connect(self._push_thresholds)  # type: ignore[attr-defined]
 
     # ── monitoring lifecycle ─────────────────────────────────────────
 
@@ -503,9 +497,9 @@ class MainWindow(QMainWindow):
 
     # ── cleanup ──────────────────────────────────────────────────────
 
-    def closeEvent(self, event):
+    def closeEvent(self, a0):
         self._stop_monitoring()
-        event.accept()
+        a0.accept()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

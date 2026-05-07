@@ -270,8 +270,10 @@ class PoseWorker(QThread):
                     trunk_tilt_deg = float(trunk_filter(t, trunk_tilt_deg))
                 if hunch_ratio is not None and hunch_filter is not None:
                     hunch_ratio = float(hunch_filter(t, hunch_ratio))
-                shoulder_tilt = float(tilt_filter(t, shoulder_tilt))
-                shoulder_depth = float(depth_filter(t, shoulder_depth))
+                if tilt_filter is not None:
+                    shoulder_tilt = float(tilt_filter(t, shoulder_tilt))
+                if depth_filter is not None:
+                    shoulder_depth = float(depth_filter(t, shoulder_depth))
 
             # Read thresholds
             self._mutex.lock()
@@ -311,7 +313,7 @@ class PoseWorker(QThread):
                 bad_frames += 1
                 good_frames = 0
 
-            fps = float(min(fps_front, fps_side) or 30.0)
+            fps = min(fps_front, fps_side) or 30.0
             good_time = (1 / fps) * good_frames
             bad_time = (1 / fps) * bad_frames
 
@@ -323,35 +325,7 @@ class PoseWorker(QThread):
             cv2.circle(image_front, r_s, 7, pink, -1)
             cv2.line(image_front, l_s, r_s, skel_color, 2)
 
-            # HUD (front)
-            cv2.putText(image_front, f'CVA:  {raw_cva_2d:.1f} deg', (10, 30), font, 0.6,
-                        light_green if is_good_neck else red, 2)
-            cv2.putText(image_front, f'Tilt: {shoulder_tilt * 100:.1f} cm', (10, 60), font, 0.6,
-                        light_green if not is_tilted else red, 2)
-            cv2.putText(image_front, f'Depth:{shoulder_depth:+.2f} m', (10, 90), font, 0.6,
-                        light_green if not is_leaning else yellow, 2)
-            if trunk_tilt_deg is not None:
-                cv2.putText(
-                    image_front,
-                    f'Trunk: {trunk_tilt_deg:.1f} deg',
-                    (10, 120),
-                    font,
-                    0.6,
-                    light_green if not is_trunk_tilted else yellow,
-                    2,
-                )
-            if hunch_ratio is not None:
-                cv2.putText(
-                    image_front,
-                    f'Hunch: {hunch_ratio:.2f}',
-                    (10, 150),
-                    font,
-                    0.6,
-                    light_green if not is_hunched else yellow,
-                    2,
-                )
-
-            # Side overlay (CVA + points)
+            # Side overlay (skeleton points only)
             side_pts = self._get_side_cva_points(lm_norm_s, ws, hs)
             if side_pts is not None:
                 (ear_x, ear_y), (c7_x, c7_y) = side_pts
@@ -361,37 +335,6 @@ class PoseWorker(QThread):
                 cv2.circle(image_side, ear_px, 6, (255, 255, 255), 2)  # Ear
                 cv2.line(image_side, c7_px, ear_px, skel_color, 2)
                 cv2.line(image_side, c7_px, (c7_px[0] + 120, c7_px[1]), (180, 180, 180), 2)
-
-            cv2.putText(
-                image_side,
-                f'2D CVA: {raw_cva_2d:.1f}°',
-                (10, 30),
-                font,
-                0.7,
-                light_green if is_good_neck else red,
-                2,
-            )
-
-            status_y = 130
-            items = []
-            if is_good_posture:
-                items.append(((10, status_y), 'Правильна постава', 0.85, light_green))
-            else:
-                # Show warnings only after the time filter confirms a bad pose.
-                if is_bad_confirmed:
-                    if is_trunk_tilted:
-                        items.append(((10, status_y), 'Бічний нахил тулуба!', 0.85, yellow))
-                        status_y += 40
-                    if is_hunched:
-                        items.append(((10, status_y), 'Згорбленість (підняті плечі)!', 0.85, yellow))
-                        status_y += 40
-                    if is_leaning:
-                        items.append(((10, status_y), 'Нахил вперед!', 0.85, yellow))
-                        status_y += 40
-                    if is_tilted:
-                        items.append(((10, status_y), 'Перекіс плечей!', 0.85, red))
-            if items:
-                _draw_unicode_batch(image_front, items)
 
             self._emit_front_frame(image_front, hf, wf)
             self._emit_side_frame(image_side, hs, ws)
@@ -465,7 +408,7 @@ class PoseWorker(QThread):
         # and the line from C7 -> ear (tragus proxy). Ensure 0..90° regardless of
         # facing direction (dx sign) and image y-axis direction.
         angle = m.degrees(m.atan2(abs(dy), abs(dx)))
-        return float(angle)
+        return angle
 
     @staticmethod
     def _get_side_cva_points(landmarks, width: int, height: int):
@@ -530,7 +473,7 @@ class PoseWorker(QThread):
         # Angle between vertical axis and the vector mid->nose
         # 0° when aligned with vertical, increases with lateral lean.
         angle = m.degrees(m.atan2(abs(dx), abs(dy)))
-        return float(angle)
+        return angle
 
     @staticmethod
     def _calculate_hunch_ratio(landmarks, width: int, height: int) -> float | None:
@@ -567,4 +510,4 @@ class PoseWorker(QThread):
         sh_y = ls_y if use_left else rs_y
 
         dy = sh_y - ear_y  # positive when ear is above shoulder
-        return float(dy / shoulder_w)
+        return dy / shoulder_w
