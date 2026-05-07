@@ -8,6 +8,7 @@ import cv2
 import math as m
 import os
 import time
+import datetime
 import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal, QMutex
 from PyQt5.QtGui import QImage
@@ -76,6 +77,7 @@ class PoseWorker(QThread):
     front_frame_ready = pyqtSignal(QImage)
     side_frame_ready = pyqtSignal(QImage)
     metrics_ready = pyqtSignal(dict)
+    session_saved = pyqtSignal()
 
     def __init__(
         self,
@@ -99,7 +101,7 @@ class PoseWorker(QThread):
         self.offset_threshold = 0.3
         self.medical_cva_threshold = 50.0
         self.trunk_tilt_threshold_deg = 12.0
-        self.hunch_ratio_threshold = 0.35
+        self.hunch_ratio_threshold = 0.55
         self.bad_pose_timeout_s = 10.0
         self.shoulder_tilt_threshold = 0.05
         self.forward_lean_threshold = 0.10
@@ -107,6 +109,34 @@ class PoseWorker(QThread):
         self.filter_min_cutoff = 0.004
         self.filter_beta = 0.7
         self._mutex = QMutex()
+
+        # ── Event accumulation state ─────────────────────────────────
+        self._session_start_time: float | None = None
+        self._pending_events: list[dict] = []
+        self._cva_accumulator: list[float] = []
+
+        # Per-condition independent 10-second timers
+        # Stores (monotonic_time, epoch_time) tuples for correct ISO conversion
+        self._bad_neck_since: tuple[float, float] | None = None
+        self._bad_lean_since: tuple[float, float] | None = None
+        self._bad_tilt_since: tuple[float, float] | None = None
+        self._bad_hunch_since: tuple[float, float] | None = None
+
+        # Grace-period: monotonic time when condition last went False
+        # (absorbs sensor noise flickers for up to _GRACE_S seconds)
+        self._bad_neck_grace: float | None = None
+        self._bad_lean_grace: float | None = None
+        self._bad_tilt_grace: float | None = None
+        self._bad_hunch_grace: float | None = None
+
+        # Max deviation accumulators (reset per event)
+        self._max_neck_dev: float = 0.0
+        self._max_lean_dev: float = 0.0
+        self._max_tilt_dev: float = 0.0
+        self._max_hunch_dev: float = 0.0
+
+        self._EVENT_HOLD_S = 10.0  # min seconds of continuous bad to qualify as event
+        self._GRACE_S = 2.0       # seconds to tolerate flicker before resetting timer
 
     # ── public API (called from GUI thread) ──────────────────────────
 
@@ -124,6 +154,21 @@ class PoseWorker(QThread):
 
     def run(self):
         self._running = True
+        self._session_start_time = time.time()
+        self._pending_events = []
+        self._cva_accumulator = []
+        self._bad_neck_since = None
+        self._bad_lean_since = None
+        self._bad_tilt_since = None
+        self._bad_hunch_since = None
+        self._bad_neck_grace = None
+        self._bad_lean_grace = None
+        self._bad_tilt_grace = None
+        self._bad_hunch_grace = None
+        self._max_neck_dev = 0.0
+        self._max_lean_dev = 0.0
+        self._max_tilt_dev = 0.0
+        self._max_hunch_dev = 0.0
 
         # Colors
         green = (127, 255, 0)
@@ -320,10 +365,17 @@ class PoseWorker(QThread):
             # ── Draw skeleton ──────────────────────────────────────
             skel_color = green if is_good_posture else red
             l_s = px(LS); r_s = px(RS)
+            l_e = px(LE); r_e = px(RE)
 
             cv2.circle(image_front, l_s, 7, white, 2)
             cv2.circle(image_front, r_s, 7, pink, -1)
             cv2.line(image_front, l_s, r_s, skel_color, 2)
+
+            hunch_color = red if is_hunched else green
+            cv2.circle(image_front, l_e, 5, yellow, -1)
+            cv2.circle(image_front, r_e, 5, yellow, -1)
+            cv2.line(image_front, l_e, l_s, hunch_color, 2)
+            cv2.line(image_front, r_e, r_s, hunch_color, 2)
 
             # Side overlay (skeleton points only)
             side_pts = self._get_side_cva_points(lm_norm_s, ws, hs)
@@ -335,6 +387,40 @@ class PoseWorker(QThread):
                 cv2.circle(image_side, ear_px, 6, (255, 255, 255), 2)  # Ear
                 cv2.line(image_side, c7_px, ear_px, skel_color, 2)
                 cv2.line(image_side, c7_px, (c7_px[0] + 120, c7_px[1]), (180, 180, 180), 2)
+
+            # ── Accumulate CVA for session average ──────────────────
+            self._cva_accumulator.append(raw_cva_2d)
+
+            # ── Per-condition event detection (10 s hold) ─────────────
+            epoch_now = time.time()
+            self._check_event_condition(
+                is_bad=not is_good_neck,
+                event_type='bad_neck',
+                deviation=abs(cva_limit - raw_cva_2d),
+                mono_now=now_s,
+                epoch_now=epoch_now,
+            )
+            self._check_event_condition(
+                is_bad=is_leaning,
+                event_type='bad_lean',
+                deviation=abs(shoulder_depth),
+                mono_now=now_s,
+                epoch_now=epoch_now,
+            )
+            self._check_event_condition(
+                is_bad=is_tilted,
+                event_type='bad_tilt',
+                deviation=shoulder_tilt,
+                mono_now=now_s,
+                epoch_now=epoch_now,
+            )
+            self._check_event_condition(
+                is_bad=is_hunched,
+                event_type='bad_hunch',
+                deviation=abs(hunch_limit - hunch_ratio) if hunch_ratio is not None else 0.0,
+                mono_now=now_s,
+                epoch_now=epoch_now,
+            )
 
             self._emit_front_frame(image_front, hf, wf)
             self._emit_side_frame(image_side, hs, ws)
@@ -367,6 +453,119 @@ class PoseWorker(QThread):
         landmarker_side.close()
         cap_front.release()
         cap_side.release()
+
+        # ── Flush accumulated data to database ───────────────────────
+        self._flush_session_to_db()
+
+    # ── Event accumulation helpers ────────────────────────────────────
+
+    _TIMER_ATTR_MAP = {
+        'bad_neck':  ('_bad_neck_since',  '_max_neck_dev',  '_bad_neck_grace'),
+        'bad_lean':  ('_bad_lean_since',  '_max_lean_dev',  '_bad_lean_grace'),
+        'bad_tilt':  ('_bad_tilt_since',  '_max_tilt_dev',  '_bad_tilt_grace'),
+        'bad_hunch': ('_bad_hunch_since', '_max_hunch_dev', '_bad_hunch_grace'),
+    }
+
+    def _check_event_condition(
+        self, *, is_bad: bool, event_type: str, deviation: float,
+        mono_now: float, epoch_now: float,
+    ):
+        since_attr, max_attr, grace_attr = self._TIMER_ATTR_MAP[event_type]
+        since = getattr(self, since_attr)  # None or (mono, epoch) tuple
+        grace = getattr(self, grace_attr)  # None or monotonic time
+
+        if is_bad:
+            # Condition is bad — clear any grace timer, accumulate
+            setattr(self, grace_attr, None)
+
+            cur_max = getattr(self, max_attr)
+            setattr(self, max_attr, max(cur_max, deviation))
+
+            if since is None:
+                # Condition just turned bad — start the timer
+                setattr(self, since_attr, (mono_now, epoch_now))
+        else:
+            # Condition is OK this frame
+            if since is not None:
+                if grace is None:
+                    # First False frame — start grace period
+                    setattr(self, grace_attr, mono_now)
+                elif (mono_now - grace) >= self._GRACE_S:
+                    # Grace period expired — truly cleared, finalize event
+                    mono_start, epoch_start = since
+                    # Duration up to when grace started (last True frame)
+                    elapsed = grace - mono_start
+                    if elapsed >= self._EVENT_HOLD_S:
+                        self._pending_events.append({
+                            'start_time': datetime.datetime.fromtimestamp(epoch_start).isoformat(),
+                            'end_time':   datetime.datetime.fromtimestamp(
+                                epoch_now - (mono_now - grace)
+                            ).isoformat(),
+                            'duration':   elapsed,
+                            'event_type': event_type,
+                            'deviation_value': getattr(self, max_attr),
+                        })
+                    # Reset
+                    setattr(self, since_attr, None)
+                    setattr(self, max_attr, 0.0)
+                    setattr(self, grace_attr, None)
+                # else: still within grace period — keep waiting
+
+    def _flush_session_to_db(self):
+        """Save the completed session and all accumulated events to the DB."""
+        if self._session_start_time is None:
+            return
+
+        session_end = time.time()
+        duration = session_end - self._session_start_time
+
+        avg_cva = (
+            sum(self._cva_accumulator) / len(self._cva_accumulator)
+            if self._cva_accumulator
+            else 0.0
+        )
+
+        # Finalize any still-open events
+        mono_now = time.monotonic()
+        for event_type, (since_attr, max_attr, grace_attr) in self._TIMER_ATTR_MAP.items():
+            since = getattr(self, since_attr)
+            if since is not None:
+                mono_start, epoch_start = since
+                elapsed = mono_now - mono_start
+                if elapsed >= self._EVENT_HOLD_S:
+                    self._pending_events.append({
+                        'start_time': datetime.datetime.fromtimestamp(epoch_start).isoformat(),
+                        'end_time':   datetime.datetime.fromtimestamp(session_end).isoformat(),
+                        'duration':   elapsed,
+                        'event_type': event_type,
+                        'deviation_value': getattr(self, max_attr),
+                    })
+                setattr(self, since_attr, None)
+                setattr(self, max_attr, 0.0)
+                setattr(self, grace_attr, None)
+
+        start_iso = datetime.datetime.fromtimestamp(self._session_start_time).isoformat()
+        end_iso = datetime.datetime.fromtimestamp(session_end).isoformat()
+
+        try:
+            from database import DatabaseManager
+            db = DatabaseManager()
+            db.save_session(
+                start_time=start_iso,
+                end_time=end_iso,
+                duration=duration,
+                avg_cva=avg_cva,
+                events=self._pending_events,
+            )
+            db.close()
+            self.session_saved.emit()
+        except Exception as exc:
+            print(f"[PoseWorker] Failed to save session to DB: {exc}")
+
+        # Cleanup
+        self._pending_events = []
+        self._cva_accumulator = []
+        self._session_start_time = None
 
     def _emit_front_frame(self, bgr_image, h, w):
         rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)

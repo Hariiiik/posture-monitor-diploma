@@ -10,6 +10,9 @@ import sys
 import math
 import numpy as np
 
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -20,6 +23,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor
 
 from worker import PoseWorker
+from database import DatabaseManager
 
 # ─── Audio warning helper ────────────────────────────────────────────────────
 
@@ -339,62 +343,182 @@ class LiveDashboardTab(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AnalyticsTab(QWidget):
-    """Tab 2 — placeholder charts for future historical analytics."""
+    """Tab 2 — Matplotlib charts for session history & posture events."""
+
+    # Ukrainian labels for event types
+    _EVENT_LABELS = {
+        'bad_neck':    'Шия',
+        'bad_lean':    'Нахил',
+        'bad_tilt':    'Перекіс плечей',
+        'bad_hunch':   'Сутулість',
+        'bad_posture': 'Погана постава',
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
 
+        # ── Title ───────────────────────────────────────────────────────
         title = QLabel("Аналітика сеансів")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("color: #ddd; font-size: 18px; font-weight: bold; padding: 12px;")
+        title.setStyleSheet(
+            "color: #ddd; font-size: 18px; font-weight: bold; padding: 8px;"
+        )
         layout.addWidget(title)
 
-        info = QLabel(
-            "Тут будуть відображатися історичні дані після підключення бази SQLCipher."
-        )
-        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        info.setStyleSheet("color: #888; font-size: 13px; padding-bottom: 10px;")
-        info.setWordWrap(True)
-        layout.addWidget(info)
+        # ── Matplotlib figure (dark-themed, two subplots) ───────────────
+        self._fig = Figure(figsize=(10, 4), dpi=100, facecolor='#0f0f23')
+        self._ax_pie = self._fig.add_subplot(1, 2, 1)
+        self._ax_bar = self._fig.add_subplot(1, 2, 2)
+        self._canvas = FigureCanvas(self._fig)
+        self._canvas.setStyleSheet("background: #0f0f23; border-radius: 8px;")
+        self._canvas.setMinimumHeight(340)
+        layout.addWidget(self._canvas, stretch=1)
 
-        # ── Pie chart placeholder ─────────────────────────────────────────
-        # TODO: підключити SQLCipher для зчитування даних сеансів.
-        pie_group = QGroupBox("Розподіл часу сеансу")
-        pie_group.setStyleSheet(
-            "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
-            "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
-            "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
+        # ── Refresh button ──────────────────────────────────────────────
+        btn_refresh = QPushButton("⊕  Оновити дані")
+        btn_refresh.setStyleSheet(
+            "QPushButton { background: #16213e; color: #ddd; border: 1px solid #555; "
+            "border-radius: 6px; padding: 8px 22px; font-size: 13px; }"
+            "QPushButton:hover { background: #1a3a5c; }"
         )
-        pie_placeholder = QLabel("Дані відсутні")
-        pie_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pie_placeholder.setMinimumHeight(150)
-        pie_placeholder.setStyleSheet("color: #666; font-size: 14px; background: #16213e; border-radius: 6px;")
-        pie_layout = QVBoxLayout()
-        pie_layout.addWidget(pie_placeholder)
-        pie_group.setLayout(pie_layout)
-        layout.addWidget(pie_group)
+        btn_refresh.setMaximumWidth(200)
+        btn_refresh.clicked.connect(self.refresh_data)  # type: ignore[attr-defined]
 
-        # ── Bar chart placeholder ─────────────────────────────────────────
-        # TODO: підключити SQLCipher для зчитування історії порушень.
-        bar_group = QGroupBox("Гістограма порушень")
-        bar_group.setStyleSheet(
-            "QGroupBox { color: #ccc; border: 1px solid #444; border-radius: 6px; "
-            "margin-top: 10px; padding-top: 14px; font-weight: bold; }"
-            "QGroupBox::title { subcontrol-position: top center; padding: 0 8px; }"
-        )
-        bar_placeholder = QLabel("Дані відсутні")
-        bar_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        bar_placeholder.setMinimumHeight(150)
-        bar_placeholder.setStyleSheet("color: #666; font-size: 14px; background: #16213e; border-radius: 6px;")
-        bar_layout = QVBoxLayout()
-        bar_layout.addWidget(bar_placeholder)
-        bar_group.setLayout(bar_layout)
-        layout.addWidget(bar_group)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(btn_refresh)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
 
         layout.addStretch()
         self.setLayout(layout)
+
+        # Draw empty state
+        self._draw_empty()
+
+    # ── data loading ─────────────────────────────────────────────────────
+
+    def refresh_data(self):
+        """Query the database and redraw both charts."""
+        try:
+            db = DatabaseManager()
+            summary = db.get_event_summary()
+            time_ratio = db.get_posture_time_ratio()
+            db.close()
+        except Exception as exc:
+            print(f"[AnalyticsTab] DB query failed: {exc}")
+            self._draw_empty()
+            return
+
+        has_time = (time_ratio['good_time'] + time_ratio['bad_time']) > 0
+        has_events = bool(summary)
+
+        if not has_time and not has_events:
+            self._draw_empty()
+            return
+
+        self._draw_charts(time_ratio, summary)
+
+    # ── drawing ──────────────────────────────────────────────────────────
+
+    def _style_ax(self, ax, title: str):
+        ax.set_facecolor('#16213e')
+        ax.set_title(title, color='#ddd', fontsize=13, fontweight='bold', pad=10)
+        ax.tick_params(colors='#aaa', labelsize=10)
+        for spine in ax.spines.values():
+            spine.set_color('#333')
+
+    def _draw_empty(self):
+        for ax in (self._ax_pie, self._ax_bar):
+            ax.clear()
+            ax.set_facecolor('#16213e')
+            ax.text(
+                0.5, 0.5, 'Дані відсутні',
+                ha='center', va='center', color='#666',
+                fontsize=14, transform=ax.transAxes,
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+        self._fig.tight_layout(pad=2.0)
+        self._canvas.draw()
+
+    def _draw_charts(self, time_ratio: dict, summary: dict):
+        # ── PIE: good vs bad time ────────────────────────────────────
+        self._ax_pie.clear()
+        self._style_ax(self._ax_pie, 'Розподіл часу')
+
+        good = time_ratio['good_time']
+        bad = time_ratio['bad_time']
+        total = good + bad
+
+        if total > 0:
+            sizes = [good, bad]
+            labels = [f'Правильна\n{good:.0f} с', f'Погана\n{bad:.0f} с']
+            colors = ['#7bc67e', '#c66e6e']
+            explode = (0.03, 0.03)
+            wedges, texts, autotexts = self._ax_pie.pie(  # type: ignore[misc]
+                sizes, labels=labels, colors=colors, explode=explode,
+                autopct='%1.1f%%', startangle=90,
+                textprops={'color': '#ddd', 'fontsize': 10},
+                pctdistance=0.55,
+            )
+            for at in autotexts:
+                at.set_color('#fff')
+                at.set_fontsize(11)
+                at.set_fontweight('bold')
+        else:
+            self._ax_pie.text(
+                0.5, 0.5, 'Дані відсутні',
+                ha='center', va='center', color='#666',
+                fontsize=14, transform=self._ax_pie.transAxes,
+            )
+
+        # ── BAR: event counts by type ────────────────────────────────
+        self._ax_bar.clear()
+        self._style_ax(self._ax_bar, 'Кількість порушень')
+
+        if summary:
+            # Ensure consistent ordering (4 real DB types)
+            db_types = ['bad_neck', 'bad_lean', 'bad_tilt', 'bad_hunch']
+            types = [t for t in db_types if t in summary]
+            counts = [summary[t] for t in types]
+
+            # Compute bad_posture as total of all violations (not stored in DB)
+            total_violations = sum(summary.values())
+            types.append('bad_posture')
+            counts.append(total_violations)
+
+            labels = [self._EVENT_LABELS.get(t, t) for t in types]
+            all_types = ['bad_neck', 'bad_lean', 'bad_tilt', 'bad_hunch', 'bad_posture']
+            bar_colors = ['#e07a5f', '#f2cc8f', '#81b29a', '#3d405b', '#c66e6e']
+            used_colors = [bar_colors[all_types.index(t)] for t in types]
+
+            bars = self._ax_bar.bar(
+                labels, counts, color=used_colors,
+                edgecolor='#333', linewidth=0.8, width=0.6,
+            )
+            # Value labels on top of each bar
+            for bar, count in zip(bars, counts):
+                self._ax_bar.text(
+                    bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+                    str(count), ha='center', va='bottom',
+                    color='#ddd', fontsize=11, fontweight='bold',
+                )
+            self._ax_bar.set_ylabel('Кількість', color='#aaa', fontsize=11)
+            import matplotlib.ticker as mticker
+            self._ax_bar.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+        else:
+            self._ax_bar.text(
+                0.5, 0.5, 'Порушень не зафіксовано',
+                ha='center', va='center', color='#666',
+                fontsize=14, transform=self._ax_bar.transAxes,
+            )
+
+        self._fig.tight_layout(pad=2.0)
+        self._canvas.draw()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -430,6 +554,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.analytics_tab, "Analytics")
         self.setCentralWidget(self.tabs)
 
+        # ── Tab switch → auto-refresh analytics ───────────────────────
+        self.tabs.currentChanged.connect(self._on_tab_changed)  # type: ignore[attr-defined]
+
         # ── Worker (not started yet) ──────────────────────────────────────
         self.worker = None
 
@@ -458,6 +585,7 @@ class MainWindow(QMainWindow):
         self.worker.side_frame_ready.connect(self.live_tab.on_side_frame)
         self.worker.metrics_ready.connect(self.live_tab.on_metrics)
         self.worker.finished.connect(self._on_worker_done)
+        self.worker.session_saved.connect(self.analytics_tab.refresh_data)
 
         self.worker.start()
 
@@ -500,6 +628,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, a0):
         self._stop_monitoring()
         a0.accept()
+
+    def _on_tab_changed(self, index: int):
+        """Auto-refresh analytics when the user switches to that tab."""
+        if index == 1:  # Analytics tab
+            self.analytics_tab.refresh_data()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -20,3 +20,4 @@ python-dateutil==2.8.2
 six==1.16.0
 sounddevice==0.4.6
 PyQt5==5.15.11
+sqlcipher3==0.5.4
