@@ -29,11 +29,6 @@ from database import DatabaseManager
 # ─── Audio warning helper ────────────────────────────────────────────────────
 
 def send_warning_beep(duration_ms=500, freq=800):
-    """
-    Play an audible warning beep.
-    Uses sounddevice + numpy to generate a sine-wave tone.
-    Falls back to a simple print if sounddevice is unavailable.
-    """
     try:
         import sounddevice as sd
         sr = 44100
@@ -41,7 +36,7 @@ def send_warning_beep(duration_ms=500, freq=800):
         wave = (0.5 * np.sin(2 * math.pi * freq * t)).astype(np.float32)
         sd.play(wave, sr, blocking=False)
     except Exception:
-        print("\a")  # terminal bell fallback
+        print("\a")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -186,8 +186,8 @@ class DatabaseManager:
         Return total *good* and *bad* time.
         If session_id is provided, filters by that session. Otherwise aggregates all.
 
-        ``bad_time`` is the sum of event durations; ``good_time`` is total
-        session duration minus ``bad_time``.
+        Calculates bad_time by computing the union of all event intervals to prevent
+        overcounting when multiple violations occur simultaneously.
 
         Returns
         -------
@@ -195,16 +195,45 @@ class DatabaseManager:
             ``{'good_time': float, 'bad_time': float}`` in seconds.
         """
         cur = self._conn.cursor()
+        
         if session_id is None:
             cur.execute("SELECT COALESCE(SUM(duration), 0) FROM sessions;")
-            total_duration = cur.fetchone()[0]
-            cur.execute("SELECT COALESCE(SUM(duration), 0) FROM events;")
-            total_bad = cur.fetchone()[0]
         else:
             cur.execute("SELECT COALESCE(SUM(duration), 0) FROM sessions WHERE session_id = ?;", (session_id,))
-            total_duration = cur.fetchone()[0]
-            cur.execute("SELECT COALESCE(SUM(duration), 0) FROM events WHERE session_id = ?;", (session_id,))
-            total_bad = cur.fetchone()[0]
+        total_duration = cur.fetchone()[0]
+
+        if session_id is None:
+            cur.execute("SELECT start_time, end_time FROM events;")
+        else:
+            cur.execute("SELECT start_time, end_time FROM events WHERE session_id = ?;", (session_id,))
+        events = cur.fetchall()
+
+        # Compute total_bad by merging overlapping event intervals
+        intervals = []
+        from datetime import datetime
+        for row in events:
+            try:
+                st = datetime.fromisoformat(row[0]).timestamp()
+                et = datetime.fromisoformat(row[1]).timestamp()
+                if et > st:
+                    intervals.append((st, et))
+            except Exception:
+                pass
+                
+        intervals.sort(key=lambda x: x[0])
+        merged = []
+        for interval in intervals:
+            if not merged:
+                merged.append(interval)
+            else:
+                prev = merged[-1]
+                if interval[0] <= prev[1]:
+                    # Overlap, merge
+                    merged[-1] = (prev[0], max(prev[1], interval[1]))
+                else:
+                    merged.append(interval)
+                    
+        total_bad = sum(end - start for start, end in merged)
 
         good = max(0.0, total_duration - total_bad)
         return {"good_time": good, "bad_time": total_bad}
