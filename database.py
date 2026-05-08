@@ -158,10 +158,10 @@ class DatabaseManager:
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def get_event_summary(self) -> dict[str, int]:
+    def get_event_summary(self, session_id: int | None = None) -> dict[str, int]:
         """
-        Aggregate event counts across **all** sessions, grouped by
-        ``event_type``.
+        Aggregate event counts, grouped by ``event_type``.
+        If session_id is provided, filters by that session. Otherwise aggregates all.
 
         Returns
         -------
@@ -170,14 +170,21 @@ class DatabaseManager:
             ``{'bad_neck': 5, 'bad_lean': 2, ...}``
         """
         cur = self._conn.cursor()
-        cur.execute(
-            "SELECT event_type, COUNT(*) AS cnt FROM events GROUP BY event_type;"
-        )
+        if session_id is None:
+            cur.execute(
+                "SELECT event_type, COUNT(*) AS cnt FROM events GROUP BY event_type;"
+            )
+        else:
+            cur.execute(
+                "SELECT event_type, COUNT(*) AS cnt FROM events WHERE session_id = ? GROUP BY event_type;",
+                (session_id,)
+            )
         return {row[0]: row[1] for row in cur.fetchall()}
 
-    def get_posture_time_ratio(self) -> dict[str, float]:
+    def get_posture_time_ratio(self, session_id: int | None = None) -> dict[str, float]:
         """
-        Return total *good* and *bad* time across all sessions.
+        Return total *good* and *bad* time.
+        If session_id is provided, filters by that session. Otherwise aggregates all.
 
         ``bad_time`` is the sum of event durations; ``good_time`` is total
         session duration minus ``bad_time``.
@@ -188,11 +195,16 @@ class DatabaseManager:
             ``{'good_time': float, 'bad_time': float}`` in seconds.
         """
         cur = self._conn.cursor()
-        cur.execute("SELECT COALESCE(SUM(duration), 0) FROM sessions;")
-        total_duration = cur.fetchone()[0]
-
-        cur.execute("SELECT COALESCE(SUM(duration), 0) FROM events;")
-        total_bad = cur.fetchone()[0]
+        if session_id is None:
+            cur.execute("SELECT COALESCE(SUM(duration), 0) FROM sessions;")
+            total_duration = cur.fetchone()[0]
+            cur.execute("SELECT COALESCE(SUM(duration), 0) FROM events;")
+            total_bad = cur.fetchone()[0]
+        else:
+            cur.execute("SELECT COALESCE(SUM(duration), 0) FROM sessions WHERE session_id = ?;", (session_id,))
+            total_duration = cur.fetchone()[0]
+            cur.execute("SELECT COALESCE(SUM(duration), 0) FROM events WHERE session_id = ?;", (session_id,))
+            total_bad = cur.fetchone()[0]
 
         good = max(0.0, total_duration - total_bad)
         return {"good_time": good, "bad_time": total_bad}

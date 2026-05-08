@@ -7,6 +7,10 @@ frames + metrics to the GUI thread via pyqtSignal.
 import cv2
 import math as m
 import os
+
+# Приховуємо спам від FFmpeg (повідомлення 'Stream ends prematurely')
+os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+
 import time
 import datetime
 import numpy as np
@@ -78,15 +82,16 @@ class PoseWorker(QThread):
     side_frame_ready = pyqtSignal(QImage)
     metrics_ready = pyqtSignal(dict)
     session_saved = pyqtSignal()
+    error_occurred = pyqtSignal(str)
 
     def __init__(
         self,
         video_path=None,
         parent=None,
-        camera_front_id: int = 0,
-        camera_side_id: int = 1,
-        front_video_path: int = 0,
-        side_video_path: str = "http://192.168.1.4:8080/video",
+        camera_front_id: int | str = 0,
+        camera_side_id: int | str = 1,
+        front_video_path: int | str | None = 0,
+        side_video_path: int | str | None = "http://192.168.1.4:8080/video",
     ):
         super().__init__(parent)
         # Back-compat: video_path is treated as front input if provided.
@@ -121,6 +126,7 @@ class PoseWorker(QThread):
         self._bad_lean_since: tuple[float, float] | None = None
         self._bad_tilt_since: tuple[float, float] | None = None
         self._bad_hunch_since: tuple[float, float] | None = None
+        self._bad_trunk_since: tuple[float, float] | None = None
 
         # Grace-period: monotonic time when condition last went False
         # (absorbs sensor noise flickers for up to _GRACE_S seconds)
@@ -128,12 +134,14 @@ class PoseWorker(QThread):
         self._bad_lean_grace: float | None = None
         self._bad_tilt_grace: float | None = None
         self._bad_hunch_grace: float | None = None
+        self._bad_trunk_grace: float | None = None
 
         # Max deviation accumulators (reset per event)
         self._max_neck_dev: float = 0.0
         self._max_lean_dev: float = 0.0
         self._max_tilt_dev: float = 0.0
         self._max_hunch_dev: float = 0.0
+        self._max_trunk_dev: float = 0.0
 
         self._EVENT_HOLD_S = 10.0  # min seconds of continuous bad to qualify as event
         self._GRACE_S = 2.0       # seconds to tolerate flicker before resetting timer
@@ -161,14 +169,17 @@ class PoseWorker(QThread):
         self._bad_lean_since = None
         self._bad_tilt_since = None
         self._bad_hunch_since = None
+        self._bad_trunk_since = None
         self._bad_neck_grace = None
         self._bad_lean_grace = None
         self._bad_tilt_grace = None
         self._bad_hunch_grace = None
+        self._bad_trunk_grace = None
         self._max_neck_dev = 0.0
         self._max_lean_dev = 0.0
         self._max_tilt_dev = 0.0
         self._max_hunch_dev = 0.0
+        self._max_trunk_dev = 0.0
 
         # Colors
         green = (127, 255, 0)
@@ -201,8 +212,25 @@ class PoseWorker(QThread):
         )
         side_src = self.side_video_path if self.side_video_path is not None else self.camera_side_id
 
-        cap_front = cv2.VideoCapture(front_src)
-        cap_side = cv2.VideoCapture(side_src)
+        def create_capture(src):
+            # Якщо це системна камера (int) на Windows, використовуємо DSHOW (менше лагів)
+            if isinstance(src, int) and os.name == 'nt':
+                cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+            else:
+                cap = cv2.VideoCapture(src)
+            # Вимикаємо буферизацію старих кадрів, щоб завжди отримувати найсвіжіший
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return cap
+
+        cap_front = create_capture(front_src)
+        cap_side = create_capture(side_src)
+
+        if not cap_front.isOpened() or not cap_side.isOpened():
+            self.error_occurred.emit("Не вдалося підключитися до обох камер.\nЗастосунок не може бути використаний.")
+            cap_front.release()
+            cap_side.release()
+            self._running = False
+            return
 
         fps_front = cap_front.get(cv2.CAP_PROP_FPS) or 30.0
         fps_side = cap_side.get(cv2.CAP_PROP_FPS) or 30.0
@@ -217,11 +245,14 @@ class PoseWorker(QThread):
         tilt_filter = None
         depth_filter = None
         bad_since_s: float | None = None
+        bad_grace_s: float | None = None
 
         while self._running:
             ok_front, image_front = cap_front.read()
             ok_side, image_side = cap_side.read()
             if not ok_front or not ok_side:
+                if good_frames == 0 and bad_frames == 0:
+                    self.error_occurred.emit("Не вдалося отримати відео з камер.\nПеревірте підключення.")
                 break
 
             live_fps_front = cap_front.get(cv2.CAP_PROP_FPS)
@@ -342,12 +373,25 @@ class PoseWorker(QThread):
 
             now_s = time.monotonic()
             if is_bad_instant:
+                bad_grace_s = None
                 if bad_since_s is None:
                     bad_since_s = now_s
             else:
-                bad_since_s = None
+                if bad_since_s is not None:
+                    if bad_grace_s is None:
+                        bad_grace_s = now_s
+                    elif (now_s - bad_grace_s) >= self._GRACE_S:
+                        bad_since_s = None
+                        bad_grace_s = None
 
-            bad_elapsed_s = (now_s - bad_since_s) if bad_since_s is not None else 0.0
+            if bad_since_s is not None:
+                if bad_grace_s is not None:
+                    bad_elapsed_s = bad_grace_s - bad_since_s
+                else:
+                    bad_elapsed_s = now_s - bad_since_s
+            else:
+                bad_elapsed_s = 0.0
+
             is_bad_confirmed = (bad_since_s is not None) and (bad_elapsed_s >= bad_timeout)
             is_good_posture = not is_bad_confirmed
 
@@ -421,6 +465,19 @@ class PoseWorker(QThread):
                 mono_now=now_s,
                 epoch_now=epoch_now,
             )
+            self._check_event_condition(
+                is_bad=is_trunk_tilted,
+                event_type='bad_trunk',
+                deviation=abs(trunk_limit - trunk_tilt_deg) if trunk_tilt_deg is not None else 0.0,
+                mono_now=now_s,
+                epoch_now=epoch_now,
+            )
+
+            smooth_bad_neck = self._bad_neck_since is not None
+            smooth_bad_lean = self._bad_lean_since is not None
+            smooth_bad_tilt = self._bad_tilt_since is not None
+            smooth_bad_hunch = self._bad_hunch_since is not None
+            smooth_bad_trunk = self._bad_trunk_since is not None
 
             self._emit_front_frame(image_front, hf, wf)
             self._emit_side_frame(image_side, hs, ws)
@@ -444,6 +501,11 @@ class PoseWorker(QThread):
                 'is_good_posture': is_good_posture,
                 'is_leaning': is_leaning,
                 'is_tilted': is_tilted,
+                'is_bad_neck_smooth': smooth_bad_neck,
+                'is_leaning_smooth': smooth_bad_lean,
+                'is_tilted_smooth': smooth_bad_tilt,
+                'is_trunk_tilted_smooth': smooth_bad_trunk,
+                'is_hunched_smooth': smooth_bad_hunch,
                 'good_time': good_time,
                 'bad_time': bad_time,
                 'fps': fps,
@@ -464,6 +526,7 @@ class PoseWorker(QThread):
         'bad_lean':  ('_bad_lean_since',  '_max_lean_dev',  '_bad_lean_grace'),
         'bad_tilt':  ('_bad_tilt_since',  '_max_tilt_dev',  '_bad_tilt_grace'),
         'bad_hunch': ('_bad_hunch_since', '_max_hunch_dev', '_bad_hunch_grace'),
+        'bad_trunk': ('_bad_trunk_since', '_max_trunk_dev', '_bad_trunk_grace'),
     }
 
     def _check_event_condition(

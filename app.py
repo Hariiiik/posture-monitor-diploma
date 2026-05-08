@@ -17,7 +17,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QGroupBox, QSpinBox, QDoubleSpinBox,
-    QFormLayout, QGridLayout,
+    QFormLayout, QGridLayout, QLineEdit, QMessageBox,
+    QComboBox
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor
@@ -164,23 +165,28 @@ class LiveDashboardTab(QWidget):
         )
         self.btn_start = QPushButton("▶  Start Monitoring")
         self.btn_stop = QPushButton("■  Stop Monitoring")
-        self.btn_calibrate = QPushButton("⊕  Calibrate")
         self.btn_stop.setEnabled(False)
-        self.btn_calibrate.setEnabled(False)
-        for b in (self.btn_start, self.btn_stop, self.btn_calibrate):
+        for b in (self.btn_start, self.btn_stop):
             b.setStyleSheet(btn_style)
 
-        self.calibrate_label = QLabel("")
-        self.calibrate_label.setStyleSheet("color: #ffcc00; font-size: 12px;")
-        self.calibrate_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.input_cam_front = QLineEdit("0")
+        self.input_cam_front.setPlaceholderText("Фронтальна (ID або URL)")
+        self.input_cam_front.setStyleSheet("background: #16213e; color: #ddd; border: 1px solid #555; border-radius: 4px; padding: 4px;")
+
+        self.input_cam_side = QLineEdit("1")
+        self.input_cam_side.setPlaceholderText("Бокова (ID або URL)")
+        self.input_cam_side.setStyleSheet("background: #16213e; color: #ddd; border: 1px solid #555; border-radius: 4px; padding: 4px;")
+
+        cam_layout = QFormLayout()
+        cam_layout.addRow("Фронтальна:", self.input_cam_front)
+        cam_layout.addRow("Бокова:", self.input_cam_side)
 
         ctrl_layout = QHBoxLayout()
         ctrl_layout.addWidget(self.btn_start)
         ctrl_layout.addWidget(self.btn_stop)
-        ctrl_layout.addWidget(self.btn_calibrate)
         ctrl_v = QVBoxLayout()
+        ctrl_v.addLayout(cam_layout)
         ctrl_v.addLayout(ctrl_layout)
-        ctrl_v.addWidget(self.calibrate_label)
         ctrl_box.setLayout(ctrl_v)
 
         # ── Settings panel (GUI thresholds) ───────────────────────────────
@@ -203,7 +209,7 @@ class LiveDashboardTab(QWidget):
 
         self.spin_tilt = QDoubleSpinBox()
         self.spin_tilt.setRange(0.01, 0.30)
-        self.spin_tilt.setValue(0.05)
+        self.spin_tilt.setValue(0.03)
         self.spin_tilt.setSingleStep(0.01)
         self.spin_tilt.setSuffix(" m")
         form.addRow("Нахил плечей:", self.spin_tilt)
@@ -279,11 +285,17 @@ class LiveDashboardTab(QWidget):
         good_t = data['good_time']
         bad_t = data['bad_time']
 
-        is_leaning = data.get('is_leaning', False)
-        is_tilted = data.get('is_tilted', False)
-        is_trunk_tilted = data.get('is_trunk_tilted', False)
-        is_hunched = data.get('is_hunched', False)
-        is_good_neck = cva >= self.spin_neck.value()
+        is_leaning = data.get('is_leaning_smooth', data.get('is_leaning', False))
+        is_tilted = data.get('is_tilted_smooth', data.get('is_tilted', False))
+        is_trunk_tilted = data.get('is_trunk_tilted_smooth', data.get('is_trunk_tilted', False))
+        is_hunched = data.get('is_hunched_smooth', data.get('is_hunched', False))
+        
+        is_bad_neck_smooth = data.get('is_bad_neck_smooth')
+        if is_bad_neck_smooth is not None:
+            is_good_neck = not is_bad_neck_smooth
+        else:
+            is_good_neck = cva >= self.spin_neck.value()
+            
         shoulder_tilt = data.get('shoulder_tilt', 0)
         shoulder_depth = data.get('shoulder_depth', 0)
         trunk_tilt_deg = data.get('trunk_tilt_deg')
@@ -347,10 +359,11 @@ class AnalyticsTab(QWidget):
 
     # Ukrainian labels for event types
     _EVENT_LABELS = {
-        'bad_neck':    'Шия',
+        'bad_neck':    'Висунута шия',
         'bad_lean':    'Нахил',
         'bad_tilt':    'Перекіс плечей',
         'bad_hunch':   'Сутулість',
+        'bad_trunk':   'Бічний нахил',
         'bad_posture': 'Погана постава',
     }
 
@@ -387,8 +400,23 @@ class AnalyticsTab(QWidget):
         btn_refresh.setMaximumWidth(200)
         btn_refresh.clicked.connect(self.refresh_data)  # type: ignore[attr-defined]
 
+        # ── Session Selector ────────────────────────────────────────────
+        self.session_combo = QComboBox()
+        self.session_combo.setStyleSheet(
+            "QComboBox { background: #16213e; color: #ddd; border: 1px solid #555; "
+            "border-radius: 4px; padding: 6px; font-size: 13px; min-width: 220px; }"
+            "QComboBox QAbstractItemView { background: #16213e; color: #ddd; selection-background-color: #1a3a5c; }"
+        )
+        self.session_combo.currentIndexChanged.connect(self._on_session_changed)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
+        
+        lbl = QLabel("Оберіть сесію:")
+        lbl.setStyleSheet("color: #ddd; font-weight: bold; font-size: 13px;")
+        btn_row.addWidget(lbl)
+        btn_row.addWidget(self.session_combo)
+        btn_row.addSpacing(10)
         btn_row.addWidget(btn_refresh)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -398,15 +426,61 @@ class AnalyticsTab(QWidget):
 
         # Draw empty state
         self._draw_empty()
+        
+        # Load sessions once
+        self.load_sessions()
+        self._load_analytics_for_current()
 
     # ── data loading ─────────────────────────────────────────────────────
 
-    def refresh_data(self):
-        """Query the database and redraw both charts."""
+    def _on_session_changed(self, index):
+        self._load_analytics_for_current()
+
+    def load_sessions(self):
+        """Load available sessions into combo box."""
+        current_data = self.session_combo.currentData() if self.session_combo.count() > 0 else None
+        
         try:
             db = DatabaseManager()
-            summary = db.get_event_summary()
-            time_ratio = db.get_posture_time_ratio()
+            sessions = db.get_all_sessions()
+            db.close()
+            
+            self.session_combo.blockSignals(True)
+            self.session_combo.clear()
+            self.session_combo.addItem("Всі сесії", None)
+            
+            idx_to_select = 0
+            for i, s in enumerate(sessions):
+                sid = s['session_id']
+                start = s['start_time']
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(start)
+                    start_str = dt.strftime("%d.%m.%Y %H:%M:%S")
+                except Exception:
+                    start_str = str(start)
+                    
+                self.session_combo.addItem(f"Сесія {sid}: {start_str}", sid)
+                if sid == current_data:
+                    idx_to_select = i + 1
+                    
+            self.session_combo.setCurrentIndex(idx_to_select)
+            self.session_combo.blockSignals(False)
+        except Exception as exc:
+            print(f"[AnalyticsTab] Failed to load sessions: {exc}")
+
+    def refresh_data(self):
+        """Query the database and redraw both charts."""
+        self.load_sessions()
+        self._load_analytics_for_current()
+
+    def _load_analytics_for_current(self):
+        """Load and display analytics for the currently selected session."""
+        session_id = self.session_combo.currentData() if self.session_combo.count() > 0 else None
+        try:
+            db = DatabaseManager()
+            summary = db.get_event_summary(session_id)
+            time_ratio = db.get_posture_time_ratio(session_id)
             db.close()
         except Exception as exc:
             print(f"[AnalyticsTab] DB query failed: {exc}")
@@ -456,7 +530,7 @@ class AnalyticsTab(QWidget):
 
         if total > 0:
             sizes = [good, bad]
-            labels = [f'Правильна\n{good:.0f} с', f'Погана\n{bad:.0f} с']
+            labels = [f'Правильна\n{good/60:.1f} хв', f'Погана\n{bad/60:.1f} хв']
             colors = ['#7bc67e', '#c66e6e']
             explode = (0.03, 0.03)
             wedges, texts, autotexts = self._ax_pie.pie(  # type: ignore[misc]
@@ -481,8 +555,8 @@ class AnalyticsTab(QWidget):
         self._style_ax(self._ax_bar, 'Кількість порушень')
 
         if summary:
-            # Ensure consistent ordering (4 real DB types)
-            db_types = ['bad_neck', 'bad_lean', 'bad_tilt', 'bad_hunch']
+            # Ensure consistent ordering
+            db_types = ['bad_neck', 'bad_lean', 'bad_tilt', 'bad_hunch', 'bad_trunk']
             types = [t for t in db_types if t in summary]
             counts = [summary[t] for t in types]
 
@@ -492,14 +566,16 @@ class AnalyticsTab(QWidget):
             counts.append(total_violations)
 
             labels = [self._EVENT_LABELS.get(t, t) for t in types]
-            all_types = ['bad_neck', 'bad_lean', 'bad_tilt', 'bad_hunch', 'bad_posture']
-            bar_colors = ['#e07a5f', '#f2cc8f', '#81b29a', '#3d405b', '#c66e6e']
+            all_types = ['bad_neck', 'bad_lean', 'bad_tilt', 'bad_hunch', 'bad_trunk', 'bad_posture']
+            bar_colors = ['#e07a5f', '#f2cc8f', '#81b29a', '#3d405b', '#b07d62', '#c66e6e']
             used_colors = [bar_colors[all_types.index(t)] for t in types]
 
             bars = self._ax_bar.bar(
-                labels, counts, color=used_colors,
+                range(len(labels)), counts, color=used_colors,
                 edgecolor='#333', linewidth=0.8, width=0.6,
             )
+            self._ax_bar.set_xticks([])
+
             # Value labels on top of each bar
             for bar, count in zip(bars, counts):
                 self._ax_bar.text(
@@ -508,6 +584,10 @@ class AnalyticsTab(QWidget):
                     color='#ddd', fontsize=11, fontweight='bold',
                 )
             self._ax_bar.set_ylabel('Кількість', color='#aaa', fontsize=11)
+            
+            # Add legend
+            self._ax_bar.legend(bars, labels, facecolor='#16213e', edgecolor='#555', labelcolor='#ddd', fontsize=10, loc='best')
+
             import matplotlib.ticker as mticker
             self._ax_bar.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
         else:
@@ -563,8 +643,6 @@ class MainWindow(QMainWindow):
         # ── Connect buttons ──────────────────────────────────────────────
         self.live_tab.btn_start.clicked.connect(self._start_monitoring)  # type: ignore[attr-defined]
         self.live_tab.btn_stop.clicked.connect(self._stop_monitoring)  # type: ignore[attr-defined]
-        # Calibration removed from worker; keep the button disabled.
-        self.live_tab.btn_calibrate.setEnabled(False)
 
         # Push threshold changes to worker
         self.live_tab.spin_neck.valueChanged.connect(self._push_thresholds)  # type: ignore[attr-defined]
@@ -578,12 +656,24 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             return
 
-        self.worker = PoseWorker(camera_front_id=0, camera_side_id=1)
+        front_val = self.live_tab.input_cam_front.text().strip()
+        side_val = self.live_tab.input_cam_side.text().strip()
+        
+        cam_front = int(front_val) if front_val.isdigit() else front_val
+        cam_side = int(side_val) if side_val.isdigit() else side_val
+
+        self.worker = PoseWorker(
+            camera_front_id=cam_front, 
+            camera_side_id=cam_side, 
+            front_video_path=None, 
+            side_video_path=None
+        )
         self._push_thresholds()
 
         self.worker.front_frame_ready.connect(self.live_tab.on_frame)
         self.worker.side_frame_ready.connect(self.live_tab.on_side_frame)
         self.worker.metrics_ready.connect(self.live_tab.on_metrics)
+        self.worker.error_occurred.connect(self._on_worker_error)
         self.worker.finished.connect(self._on_worker_done)
         self.worker.session_saved.connect(self.analytics_tab.refresh_data)
 
@@ -591,9 +681,14 @@ class MainWindow(QMainWindow):
 
         self.live_tab.btn_start.setEnabled(False)
         self.live_tab.btn_stop.setEnabled(True)
-        self.live_tab.btn_calibrate.setEnabled(True)
+        self.live_tab.input_cam_front.setEnabled(False)
+        self.live_tab.input_cam_side.setEnabled(False)
         self.live_tab.video_label.setText("")
         self.live_tab.side_video_label.setText("")
+
+    def _on_worker_error(self, message: str):
+        QMessageBox.critical(self, "Помилка підключення", message)
+        self._stop_monitoring()
 
     def _stop_monitoring(self):
         if self.worker:
@@ -603,13 +698,15 @@ class MainWindow(QMainWindow):
 
         self.live_tab.btn_start.setEnabled(True)
         self.live_tab.btn_stop.setEnabled(False)
-        self.live_tab.btn_calibrate.setEnabled(False)
+        self.live_tab.input_cam_front.setEnabled(True)
+        self.live_tab.input_cam_side.setEnabled(True)
         self.live_tab.video_label.setText("Моніторинг зупинено")
 
     def _on_worker_done(self):
         self.live_tab.btn_start.setEnabled(True)
         self.live_tab.btn_stop.setEnabled(False)
-        self.live_tab.btn_calibrate.setEnabled(False)
+        self.live_tab.input_cam_front.setEnabled(True)
+        self.live_tab.input_cam_side.setEnabled(True)
 
     # ── push GUI thresholds to worker ────────────────────────────────
 
