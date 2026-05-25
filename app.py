@@ -28,22 +28,53 @@ from database import DatabaseManager
 
 # ─── Audio warning helper ────────────────────────────────────────────────────
 
-def send_warning_beep(duration_ms=500, freq=800):
+def _generate_tone(freq, duration_ms, sr=44100, volume=0.5):
+    t = np.linspace(0, duration_ms / 1000.0, int(sr * duration_ms / 1000.0), endpoint=False)
+    wave = np.sin(2 * math.pi * freq * t)
+    
+    # ADSR envelope to avoid clicks
+    attack_time = min(0.05, (duration_ms / 1000.0) * 0.1)
+    release_time = min(0.1, (duration_ms / 1000.0) * 0.3)
+    attack_samples = int(attack_time * sr)
+    release_samples = int(release_time * sr)
+    
+    envelope = np.ones_like(wave)
+    if attack_samples > 0:
+        envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
+    if release_samples > 0:
+        envelope[-release_samples:] = np.linspace(1, 0, release_samples)
+        
+    return (wave * envelope * volume).astype(np.float32)
+
+def send_warning_beep(intensity=1):
     try:
         import sounddevice as sd
         sr = 44100
-        t = np.linspace(0, duration_ms / 1000.0, int(sr * duration_ms / 1000.0), endpoint=False)
-        wave = (0.5 * np.sin(2 * math.pi * freq * t)).astype(np.float32)
+        
+        if intensity == 1:
+
+            t1 = _generate_tone(440.0, 300, volume=0.3) 
+            gap = np.zeros(int(sr * 0.05), dtype=np.float32)
+            t2 = _generate_tone(554.37, 400, volume=0.3) 
+            wave = np.concatenate([t1, gap, t2])
+        elif intensity == 2:
+
+            t1 = _generate_tone(800.0, 200, volume=0.5)
+            gap = np.zeros(int(sr * 0.1), dtype=np.float32)
+            wave = np.concatenate([t1, gap, t1, gap, t1])
+        else:
+
+            t1 = _generate_tone(1000.0, 150, volume=0.7)
+            t2 = _generate_tone(1200.0, 150, volume=0.7)
+            wave = np.concatenate([t1, t2, t1, t2, t1, t2, t1, t2])
+            
         sd.play(wave, sr, blocking=False)
     except Exception:
         print("\a")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  Live Dashboard Tab
-# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Pastel color constants ────────────────────────────────────────────────────
+
 PASTEL_GREEN_BG = "#c8f7c5"       # card background when OK
 PASTEL_GREEN_BORDER = "#7bc67e"   # card border when OK
 PASTEL_GREEN_TEXT = "#2d6a2d"     # card text when OK
@@ -64,7 +95,7 @@ DORMANT_TEXT = "#888"             # card text when idle
 def _card_style(bg, border, text_color):
     return (
         f"background: {bg}; border: 2px solid {border}; border-radius: 10px; "
-        f"padding: 10px; color: {text_color}; font-size: 13px; font-weight: bold;"
+        f"padding: 10px 5px; color: {text_color}; font-size: 15px; font-weight: bold;"
     )
 
 
@@ -74,24 +105,23 @@ class LiveDashboardTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._warning_active = False
+        self._warning_stage = 0
         self._calibrating = False
 
         # ── Video widget ──────────────────────────────────────────────────
         self.video_label = QLabel("Натисніть «Start Monitoring» для початку")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setMinimumSize(640, 480)
+        self.video_label.setMinimumSize(400, 300)
         self.video_label.setStyleSheet(
-            "background: #1a1a2e; color: #888; border: 2px solid #333; border-radius: 8px;"
+            "background: transparent; color: #888; border: none;"
         )
 
         # ── Side (picture-in-picture) video widget ────────────────────────
         self.side_video_label = QLabel("")
         self.side_video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.side_video_label.setMinimumSize(320, 240)
-        self.side_video_label.setMaximumSize(360, 270)
+        self.side_video_label.setMinimumSize(400, 300)
         self.side_video_label.setStyleSheet(
-            "background: #111827; color: #888; border: 2px solid #333; border-radius: 8px;"
+            "background: transparent; color: #888; border: none;"
         )
 
         # ── Status indicator cards ─────────────────────────────────────────
@@ -108,22 +138,22 @@ class LiveDashboardTab(QWidget):
 
         self.card_posture = QLabel("Постава\n—")
         self.card_posture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.card_posture.setMinimumHeight(62)
+        self.card_posture.setFixedSize(170, 95)
         self.card_posture.setStyleSheet(dormant)
 
         self.card_trunk = QLabel("Нахил тулуба\n—")
         self.card_trunk.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.card_trunk.setMinimumHeight(62)
+        self.card_trunk.setFixedSize(170, 95)
         self.card_trunk.setStyleSheet(dormant)
 
         self.card_shoulders = QLabel("Плечі\n—")
         self.card_shoulders.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.card_shoulders.setMinimumHeight(62)
+        self.card_shoulders.setFixedSize(170, 95)
         self.card_shoulders.setStyleSheet(dormant)
 
         self.card_neck = QLabel("Шия\n—")
         self.card_neck.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.card_neck.setMinimumHeight(62)
+        self.card_neck.setFixedSize(170, 95)
         self.card_neck.setStyleSheet(dormant)
 
         cards_grid.addWidget(self.card_posture, 0, 0)
@@ -211,7 +241,7 @@ class LiveDashboardTab(QWidget):
 
         self.spin_lean = QDoubleSpinBox()
         self.spin_lean.setRange(0.01, 0.50)
-        self.spin_lean.setValue(0.10)
+        self.spin_lean.setValue(0.15)
         self.spin_lean.setSingleStep(0.01)
         self.spin_lean.setSuffix(" m")
         form.addRow("Нахил вперед:", self.spin_lean)
@@ -239,7 +269,7 @@ class LiveDashboardTab(QWidget):
         # ── Main layout ──────────────────────────────────────────────────
         main_layout = QHBoxLayout()
         left_videos = QHBoxLayout()
-        left_videos.addWidget(self.video_label, stretch=3)
+        left_videos.addWidget(self.video_label, stretch=1)
         left_videos.addWidget(self.side_video_label, stretch=1)
         left_w = QWidget()
         left_w.setLayout(left_videos)
@@ -330,19 +360,36 @@ class LiveDashboardTab(QWidget):
 
         # Warning if bad posture > time_threshold
         time_threshold = self.spin_time.value()
-        if bad_t > time_threshold and not self._warning_active:
-            self._warning_active = True
-            send_warning_beep()
-            mw = self.window()
-            if mw is not None:
-                mw.setStyleSheet(
-                    mw.styleSheet() + " QMainWindow { border: 3px solid #ff3333; }"
-                )
-        elif good:
-            self._warning_active = False
-            mw = self.window()
-            if isinstance(mw, MainWindow):
-                mw.setStyleSheet(mw._base_style)
+        
+        if good:
+            if getattr(self, '_warning_stage', 0) > 0:
+                self._warning_stage = 0
+                mw = self.window()
+                if isinstance(mw, MainWindow):
+                    mw.setStyleSheet(mw._base_style)
+        else:
+            if not hasattr(self, '_warning_stage'):
+                self._warning_stage = 0
+            
+            stage = 0
+            if bad_t >= time_threshold + 90:
+                stage = 3
+            elif bad_t >= time_threshold + 30:
+                stage = 2
+            elif bad_t >= time_threshold:
+                stage = 1
+                
+            if stage > self._warning_stage:
+                old_stage = self._warning_stage
+                self._warning_stage = stage
+                send_warning_beep(intensity=stage)
+                
+                if old_stage == 0:
+                    mw = self.window()
+                    if mw is not None:
+                        mw.setStyleSheet(
+                            mw.styleSheet() + " QMainWindow { border: 3px solid #ff3333; }"
+                        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

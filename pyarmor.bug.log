@@ -1,0 +1,31 @@
+[BUG]: Command '['C:\\Users\\Hariiik\\AppData\\Local\\Programs\\Python\\Python313\\python.exe', '-m', 'PyInstaller', '--clean', '--distpath', 'dist', '--workpath', '.pyarmor\\pack\\build', '--additional-hooks-dir', '.pyarmor\\pack', '-F', '--noconsole', '--add-data', 'pose_landmarker_full.task;.', '.pyarmor\\pack\\dist\\app.py']' returned non-zero exit status 1.
+
+## Command Line
+C:\Users\Hariiik\AppData\Local\Programs\Python\Python313\Scripts\pyarmor gen --pack onefile app.py
+
+## Environments
+Python 3.13.5
+Pyarmor 9.2.4 (trial), 000000, non-profits
+Platform windows.x86_64
+Native windows.amd64
+Home C:\Users\Hariiik\.pyarmor
+
+## Traceback
+Traceback (most recent call last):
+  File "C:\Users\Hariiik\AppData\Local\Programs\Python\Python313\Lib\site-packages\pyarmor\cli\__main__.py", line 804, in main
+    main_entry(sys.argv[1:])
+    ~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\Hariiik\AppData\Local\Programs\Python\Python313\Lib\site-packages\pyarmor\cli\__main__.py", line 789, in main_entry
+    return args.func(ctx, args)
+           ~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\Hariiik\AppData\Local\Programs\Python\Python313\Lib\site-packages\pyarmor\cli\__main__.py", line 246, in cmd_gen
+    packer.build()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\Hariiik\AppData\Local\Programs\Python\Python313\Lib\site-packages\pyarmor\cli\repack.py", line 201, in build
+    check_call(cmdlist)
+    ~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\Hariiik\AppData\Local\Programs\Python\Python313\Lib\subprocess.py", line 419, in check_call
+    raise CalledProcessError(retcode, cmd)
+subprocess.CalledProcessError: Command '['C:\\Users\\Hariiik\\AppData\\Local\\Programs\\Python\\Python313\\python.exe', '-m', 'PyInstaller', '--clean', '--distpath', 'dist', '--workpath', '.pyarmor\\pack\\build', '--additional-hooks-dir', '.pyarmor\\pack', '-F', '--noconsole', '--add-data', 'pose_landmarker_full.task;.', '.pyarmor\\pack\\dist\\app.py']' returned non-zero exit status 1.
+
+

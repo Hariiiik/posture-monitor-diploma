@@ -21,9 +21,19 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
+import sys
 from one_euro_filter import OneEuroFilter
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker_full.task")
+def get_resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+MODEL_PATH = get_resource_path("pose_landmarker_full.task")
 
 # Landmark indices (MediaPipe Pose)
 LEFT_SHOULDER = 11
@@ -109,7 +119,7 @@ class PoseWorker(QThread):
         self.hunch_ratio_threshold = 0.55
         self.bad_pose_timeout_s = 10.0
         self.shoulder_tilt_threshold = 0.05
-        self.forward_lean_threshold = 0.10
+        self.forward_lean_threshold = 0.15
         self.time_threshold = 180
         self.filter_min_cutoff = 0.004
         self.filter_beta = 0.7
@@ -192,17 +202,22 @@ class PoseWorker(QThread):
         font = cv2.FONT_HERSHEY_SIMPLEX
 
         # MediaPipe init
-        base_options = mp_python.BaseOptions(
-            model_asset_path=MODEL_PATH,
-            delegate=mp_python.BaseOptions.Delegate.CPU,
-        )
-        options = mp_vision.PoseLandmarkerOptions(
-            base_options=base_options,
-            running_mode=mp_vision.RunningMode.VIDEO,
-            num_poses=1,
-        )
-        landmarker_front = mp_vision.PoseLandmarker.create_from_options(options)
-        landmarker_side = mp_vision.PoseLandmarker.create_from_options(options)
+        try:
+            base_options = mp_python.BaseOptions(
+                model_asset_path=MODEL_PATH,
+                delegate=mp_python.BaseOptions.Delegate.CPU,
+            )
+            options = mp_vision.PoseLandmarkerOptions(
+                base_options=base_options,
+                running_mode=mp_vision.RunningMode.VIDEO,
+                num_poses=1,
+            )
+            landmarker_front = mp_vision.PoseLandmarker.create_from_options(options)
+            landmarker_side = mp_vision.PoseLandmarker.create_from_options(options)
+        except Exception as e:
+            self.error_occurred.emit(f"Помилка завантаження моделі MediaPipe:\n{e}\n\nШукали за шляхом: {MODEL_PATH}")
+            self._running = False
+            return
 
         # VideoCapture init (front + side)
         front_src = (

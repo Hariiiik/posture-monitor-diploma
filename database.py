@@ -20,8 +20,37 @@ except ImportError:
     # Fallback: plain sqlite3 (no encryption) — useful for dev / testing
     import sqlite3  # type: ignore[no-redef]
 
+import secrets
+
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
 DB_FILENAME = "posture_monitor.db"
-DB_KEY = "secret_password"
+
+def get_secure_db_key() -> str:
+    """
+    Retrieves the DB key from Windows Credential Manager. 
+    If it doesn't exist, generates a strong random key and saves it.
+    """
+    if keyring is None:
+        print("[Warning] 'keyring' module not installed. Using unsafe fallback password.")
+        return os.environ.get("POSTURE_DB_KEY", "secret_password")
+        
+    service_id = "PostureMonitorApp"
+    username = "local_db_user"
+    
+    # Try to get existing key
+    key = keyring.get_password(service_id, username)
+    if not key:
+        # Generate a new 32-byte (64 characters) secure random hex key
+        key = secrets.token_hex(32)
+        keyring.set_password(service_id, username, key)
+        
+    return key
+
+DB_KEY = get_secure_db_key()
 
 
 class DatabaseManager:

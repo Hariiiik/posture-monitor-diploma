@@ -1,0 +1,3 @@
+[pack]
+pyi_options = --noconsole --add-data pose_landmarker_full.task;.
+
